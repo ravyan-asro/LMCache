@@ -13,7 +13,6 @@
 # limitations under the License.
 
 # Standard
-import os
 import socket
 
 # Third Party
@@ -67,10 +66,6 @@ def get_ip():
     """
     Get the local IP address of the machine.
     """
-    override_ip = os.getenv("LMCACHE_WORKER_IP")
-    if override_ip:
-        logger.info("Using LMCACHE_WORKER_IP override: %s", override_ip)
-        return override_ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         # "Connect" to a public IP — just to determine local IP

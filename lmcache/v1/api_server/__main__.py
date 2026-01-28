@@ -33,6 +33,7 @@ from lmcache.v1.cache_controller.message import (  # noqa: E501
     ClearRetMsg,
     CompressMsg,
     CompressRetMsg,
+    ErrorMsg,
     HealthMsg,
     HealthRetMsg,
     LookupMsg,
@@ -121,6 +122,8 @@ def create_app(controller_url: str) -> FastAPI:
                 locations=req.locations,
             )
             ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
+            if isinstance(ret_msg, ErrorMsg):
+                raise HTTPException(status_code=500, detail=ret_msg.error)
             assert isinstance(ret_msg, ClearRetMsg)
             return ClearResponse(success=ret_msg.success)
         except Exception as e:

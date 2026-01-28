@@ -16,7 +16,6 @@
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, List, Optional
-import os
 import threading
 
 # Third Party
@@ -424,8 +423,8 @@ class LocalCPUBackend(StorageBackendInterface):
         with self.cpu_lock:
             for key in self.hot_cache:
                 memory_obj = self.hot_cache[key]
-                # if memory_obj.get_ref_count() > 1:
-                #     continue
+                if memory_obj.get_ref_count() > 1:
+                    continue
                 clear_keys.append(key)
 
         for key in clear_keys:

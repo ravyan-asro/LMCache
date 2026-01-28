@@ -146,10 +146,6 @@ class LocalDiskBackend(StorageBackendInterface):
         shape = memory_obj.metadata.shape
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
-        # Store old_positions if it exists (set during batched_from_gpu)
-        old_positions = None
-        if hasattr(memory_obj.metadata, 'old_positions') and memory_obj.metadata.old_positions is not None:
-            old_positions = memory_obj.metadata.old_positions
 
         has_stored = False
         with self.disk_lock:
@@ -158,7 +154,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.dict.pop(key)
                 has_stored = True
 
-            self.dict[key] = DiskCacheMetadata(path, size, shape, dtype, fmt, False, old_positions)
+            self.dict[key] = DiskCacheMetadata(path, size, shape, dtype, fmt, False)
 
         # push kv admit msg
         if self.lmcache_worker is not None and not has_stored:
@@ -226,7 +222,7 @@ class LocalDiskBackend(StorageBackendInterface):
         assert dtype is not None
         assert shape is not None
         future = asyncio.run_coroutine_threadsafe(
-            self.async_load_bytes_from_disk(path, dtype, shape, fmt, key), self.loop
+            self.async_load_bytes_from_disk(path, dtype, shape, fmt), self.loop
         )
         return future
 
@@ -251,7 +247,7 @@ class LocalDiskBackend(StorageBackendInterface):
         fmt = self.dict[key].fmt
         assert dtype is not None
         assert shape is not None
-        memory_obj = self.load_bytes_from_disk(path, dtype=dtype, shape=shape, fmt=fmt, key=key)
+        memory_obj = self.load_bytes_from_disk(path, dtype=dtype, shape=shape, fmt=fmt)
         self.disk_lock.release()
         return memory_obj
 
@@ -299,7 +295,7 @@ class LocalDiskBackend(StorageBackendInterface):
     # TODO(Jiayi): use `bytes_read = await f.readinto(buffer)`
     # for better performance (i.e., fewer copy)
     async def async_load_bytes_from_disk(
-        self, path: str, dtype: torch.dtype, shape: torch.Size, fmt: MemoryFormat, key: Optional[CacheEngineKey] = None
+        self, path: str, dtype: torch.dtype, shape: torch.Size, fmt: MemoryFormat
     ) -> Optional[MemoryObj]:
         """
         Async load bytearray from disk.
@@ -311,20 +307,13 @@ class LocalDiskBackend(StorageBackendInterface):
         buffer = memory_obj.byte_array
         async with aiofiles.open(path, "rb") as f:
             await f.readinto(buffer)
-        
-        # Restore old_positions from metadata if available (same as CPU backend)
-        if key is not None:
-            with self.disk_lock:
-                if key in self.dict and self.dict[key].old_positions is not None:
-                    memory_obj.metadata.old_positions = self.dict[key].old_positions
-        
         return memory_obj
 
     # TODO(Jiayi): use memory allocator to redeuce cpu buffer allocation
     # TODO(Jiayi): the pinned cpu memory_obj should directly be passed into
     # gpu connector; this gpu buffer could be avoided
     def load_bytes_from_disk(
-        self, path: str, dtype: torch.dtype, shape: torch.Size, fmt: MemoryFormat, key: Optional[CacheEngineKey] = None
+        self, path: str, dtype: torch.dtype, shape: torch.Size, fmt: MemoryFormat
     ) -> Optional[MemoryObj]:
         """
         Load bytearray from disk.
@@ -336,13 +325,6 @@ class LocalDiskBackend(StorageBackendInterface):
         buffer = memory_obj.byte_array
         with open(path, "rb") as f:
             f.readinto(buffer)
-        
-        # Restore old_positions from metadata if available (same as CPU backend)
-        if key is not None:
-            with self.disk_lock:
-                if key in self.dict and self.dict[key].old_positions is not None:
-                    memory_obj.metadata.old_positions = self.dict[key].old_positions
-        
         return memory_obj
 
     @_lmcache_nvtx_annotate
@@ -371,14 +353,3 @@ class LocalDiskBackend(StorageBackendInterface):
             self.disk_lock.acquire()
             self.lookup_server.batched_remove(list(self.dict.keys()))
             self.disk_lock.release()
-
-    def clear(self) -> int:
-        """
-        Clear all cached KV chunks from disk.
-        Returns the number of cleared keys.
-        """
-        with self.disk_lock:
-            clear_keys = list(self.dict.keys())
-        for key in clear_keys:
-            self.remove(key)
-        return len(clear_keys)

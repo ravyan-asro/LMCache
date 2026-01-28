@@ -41,7 +41,6 @@ class DiskCacheMetadata:
     dtype: Optional[torch.dtype] = None
     fmt: MemoryFormat = None
     is_pin: bool = False
-    old_positions: Optional[torch.Tensor] = None  # Positions when cache was stored (for blending)
 
     def pin(self) -> bool:
         self.is_pin = True
