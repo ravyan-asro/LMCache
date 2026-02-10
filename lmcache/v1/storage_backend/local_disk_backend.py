@@ -17,8 +17,12 @@ from collections import OrderedDict
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, List, Optional
 import asyncio
+import ctypes
+import errno
 import os
+import math
 import threading
+import time
 
 # Third Party
 import aiofiles
@@ -77,9 +81,97 @@ class LocalDiskBackend(StorageBackendInterface):
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
+        self.use_direct_io = (
+            os.getenv("LMCACHE_LOCAL_DISK_DIRECT_IO", "0").lower() in {"1", "true"}
+        )
+        self.direct_io_block_size = int(
+            os.getenv("LMCACHE_LOCAL_DISK_DIRECT_IO_BLOCK_SIZE", "4096")
+        )
+        self._libc = None
+        logger.info(
+            "LocalDiskBackend: use_direct_io=%s, block_size=%d, path=%s",
+            self.use_direct_io, self.direct_io_block_size, self.path,
+        )
 
     def __str__(self):
         return self.__class__.__name__
+
+    def _round_up(self, size: int) -> int:
+        block = self.direct_io_block_size
+        return int(math.ceil(size / block) * block)
+
+    def _get_libc(self):
+        if self._libc is None:
+            self._libc = ctypes.CDLL("libc.so.6")
+        return self._libc
+
+    def _alloc_aligned_buffer(self, size: int) -> tuple[memoryview, ctypes.c_void_p]:
+        libc = self._get_libc()
+        buf_ptr = ctypes.c_void_p()
+        ret = libc.posix_memalign(
+            ctypes.byref(buf_ptr), self.direct_io_block_size, size
+        )
+        if ret != 0:
+            raise OSError(ret, "posix_memalign failed")
+        buf_type = (ctypes.c_char * size).from_address(buf_ptr.value)
+        return memoryview(buf_type), buf_ptr
+
+    def _free_aligned_buffer(self, buf_ptr: ctypes.c_void_p) -> None:
+        libc = self._get_libc()
+        libc.free(buf_ptr)
+
+    def _read_direct_into(self, path: str, memory_obj: MemoryObj, size: int) -> None:
+        padded_size = self._round_up(size)
+        buf_view, buf_ptr = self._alloc_aligned_buffer(padded_size)
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            remaining = padded_size
+            offset = 0
+            t0 = time.perf_counter()
+            while remaining > 0:
+                read = os.readv(fd, [buf_view[offset : offset + remaining]])
+                if read == 0:
+                    break
+                offset += read
+                remaining -= read
+            elapsed = time.perf_counter() - t0
+            bw_gbs = padded_size / elapsed / (1024 ** 3) if elapsed > 0 else float("inf")
+            logger.info(
+                "DiskRead O_DIRECT: %.3f MB in %.3f ms => %.2f GB/s  [%s]",
+                padded_size / (1024 ** 2),
+                elapsed * 1000,
+                bw_gbs,
+                os.path.basename(path),
+            )
+            memory_obj.byte_array.cast('B')[:size] = buf_view.cast('B')[:size]
+        finally:
+            if fd is not None:
+                os.close(fd)
+            self._free_aligned_buffer(buf_ptr)
+
+    def _write_direct_from(self, path: str, memory_obj: MemoryObj, size: int) -> None:
+        padded_size = self._round_up(size)
+        buf_view, buf_ptr = self._alloc_aligned_buffer(padded_size)
+        buf_view.cast('B')[:size] = memory_obj.byte_array.cast('B')[:size]
+        if padded_size > size:
+            buf_view[size:padded_size] = b"\x00" * (padded_size - size)
+        fd = None
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT)
+            remaining = padded_size
+            offset = 0
+            while remaining > 0:
+                written = os.writev(fd, [buf_view[offset : offset + remaining]])
+                if written == 0:
+                    raise OSError("writev returned 0 bytes")
+                offset += written
+                remaining -= written
+            os.fsync(fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            self._free_aligned_buffer(buf_ptr)
 
     def _key_to_path(
         self,
@@ -285,8 +377,28 @@ class LocalDiskBackend(StorageBackendInterface):
         self.usage += size
         self.stats_monitor.update_local_storage_usage(self.usage)
 
-        async with aiofiles.open(path, "wb") as f:
-            await f.write(byte_array)
+        if self.use_direct_io:
+            try:
+                await asyncio.to_thread(
+                    self._write_direct_from, path, memory_obj, len(byte_array)
+                )
+            except OSError as e:
+                if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
+                    logger.warning(
+                        "Direct I/O unsupported for %s; falling back to buffered I/O.",
+                        path,
+                    )
+                else:
+                    raise
+                logger.warning(
+                    "Direct I/O unsupported for %s; falling back to buffered I/O.",
+                    path,
+                )
+                async with aiofiles.open(path, "wb") as f:
+                    await f.write(byte_array)
+        else:
+            async with aiofiles.open(path, "wb") as f:
+                await f.write(byte_array)
 
         self.insert_key(key, memory_obj)
 
@@ -308,9 +420,30 @@ class LocalDiskBackend(StorageBackendInterface):
         if memory_obj is None:
             logger.debug("Memory allocation failed during async disk load.")
             return None
-        buffer = memory_obj.byte_array
-        async with aiofiles.open(path, "rb") as f:
-            await f.readinto(buffer)
+        if self.use_direct_io:
+            try:
+                await asyncio.to_thread(
+                    self._read_direct_into, path, memory_obj, memory_obj.get_size()
+                )
+            except OSError as e:
+                if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
+                    logger.warning(
+                        "Direct I/O unsupported for %s; falling back to buffered I/O.",
+                        path,
+                    )
+                else:
+                    raise
+                logger.warning(
+                    "Direct I/O unsupported for %s; falling back to buffered I/O.",
+                    path,
+                )
+                buffer = memory_obj.byte_array
+                async with aiofiles.open(path, "rb") as f:
+                    await f.readinto(buffer)
+        else:
+            buffer = memory_obj.byte_array
+            async with aiofiles.open(path, "rb") as f:
+                await f.readinto(buffer)
         
         # Restore old_positions from metadata if available (same as CPU backend)
         if key is not None:
@@ -333,9 +466,28 @@ class LocalDiskBackend(StorageBackendInterface):
         if memory_obj is None:
             logger.debug("Memory allocation failed during async disk load.")
             return None
-        buffer = memory_obj.byte_array
-        with open(path, "rb") as f:
-            f.readinto(buffer)
+        if self.use_direct_io:
+            try:
+                self._read_direct_into(path, memory_obj, memory_obj.get_size())
+            except OSError as e:
+                if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
+                    logger.warning(
+                        "Direct I/O unsupported for %s; falling back to buffered I/O.",
+                        path,
+                    )
+                else:
+                    raise
+                logger.warning(
+                    "Direct I/O unsupported for %s; falling back to buffered I/O.",
+                    path,
+                )
+                buffer = memory_obj.byte_array
+                with open(path, "rb") as f:
+                    f.readinto(buffer)
+        else:
+            buffer = memory_obj.byte_array
+            with open(path, "rb") as f:
+                f.readinto(buffer)
         
         # Restore old_positions from metadata if available (same as CPU backend)
         if key is not None:

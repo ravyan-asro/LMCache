@@ -546,19 +546,19 @@ class LMCacheEngine:
                 ),
             )
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-            next(mem_obj_consumer)
+            next(mem_obj_consumer) # prepare the GPU connector for the first layer
 
             to_count_down = []
             for layer_id in range(self.num_layers):
-                tasks = next(get_generator)
+                tasks = next(get_generator) # request the memory objects of the next layer from the storage backend. start the async submit prefetch task.
 
                 assert None not in tasks
 
                 yield None
 
-                mem_objs_layer = [task.result() for task in tasks]
-                mem_obj_consumer.send(mem_objs_layer)
-                to_count_down.extend(mem_objs_layer)
+                mem_objs_layer = [task.result() for task in tasks] # wait for the memory objects to be retrieved. This is the longest wait.
+                mem_obj_consumer.send(mem_objs_layer) # send the memory objects to the GPU connector
+                to_count_down.extend(mem_objs_layer) # count down the reference count of the memory objects
 
             # TODO(Jiayi): Need to be done in a modular way
             for keys_layer in keys_layer_major:

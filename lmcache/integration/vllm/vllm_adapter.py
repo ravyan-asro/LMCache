@@ -203,6 +203,7 @@ def init_lmcache_engine(
                 chunk_size=chunk_size,
                 dtype=kv_dtype,
                 device=device,
+                max_tokens=model_config.max_model_len,
             )
         else:
             vllm_gpu_connector = VLLMPagedMemLayerwiseGPUConnector(

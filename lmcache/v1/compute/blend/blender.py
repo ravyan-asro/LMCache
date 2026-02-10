@@ -139,12 +139,12 @@ class LMCBlender:
         layerwise_model_executor = self.layerwise_model.compute_layer(tokens)
         layerwise_retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
 
-        next(layerwise_retriever)
+        next(layerwise_retriever) # request layer 1 from storage backend
         yield
 
         for i in range(self.num_layers):
-            next(layerwise_retriever)
-            next(layerwise_model_executor)
+            next(layerwise_retriever) # request layer i+1 from storage backend
+            next(layerwise_model_executor) # compute layer i 
             yield
 
         next(layerwise_retriever)
