@@ -15,6 +15,7 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
+import os
 
 # Third Party
 import torch
@@ -341,6 +342,9 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.store_stream = torch.cuda.Stream()
 
         self.buffer_mapping = {}
+        self.enable_layer_timing = (
+            os.getenv("LMCACHE_ENABLE_LAYER_TIMING", "0").lower() in {"1", "true"}
+        )
 
     def get_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -425,6 +429,9 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             old_positions_full = torch.zeros(
                 (num_all_tokens,), dtype=torch.int64, device=kvcaches[0].device
             )
+        h2d_prev_start_evt = None
+        h2d_prev_end_evt = None
+        h2d_prev_bytes = 0
         for layer_id in range(self.num_layers + 2):
             if layer_id > 1:
                 lmc_ops.single_layer_kv_transfer(
@@ -442,6 +449,18 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
                 torch.cuda.synchronize()
+
+                if self.enable_layer_timing and h2d_prev_start_evt is not None:
+                    # synchronize() above guarantees load_stream events are done
+                    h2d_ms = h2d_prev_start_evt.elapsed_time(h2d_prev_end_evt)
+                    bw_gbs = (
+                        h2d_prev_bytes / (h2d_ms / 1000) / (1024 ** 3)
+                        if h2d_ms > 0 else float("inf")
+                    )
+                    logger.info(
+                        "H2D layer %d: %.3f MB in %.3f ms => %.2f GB/s",
+                        layer_id - 1, h2d_prev_bytes / (1024 ** 2), h2d_ms, bw_gbs,
+                    )
 
                 # ping-pong the buffers
                 compute_gpu_buffer_obj, load_gpu_buffer_obj = (
@@ -467,6 +486,10 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
                 # memobj -> gpu_buffer
                 with torch.cuda.stream(self.load_stream):
+                    if self.enable_layer_timing:
+                        h2d_start_evt = torch.cuda.Event(enable_timing=True)
+                        h2d_end_evt = torch.cuda.Event(enable_timing=True)
+                        h2d_start_evt.record()
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
@@ -484,6 +507,11 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                             old_positions_full[
                                 start - buf_offset : end - buf_offset
                             ] = memory_obj.metadata.old_positions
+                    if self.enable_layer_timing:
+                        h2d_end_evt.record()
+                        h2d_prev_start_evt = h2d_start_evt
+                        h2d_prev_end_evt = h2d_end_evt
+                        h2d_prev_bytes = sum(mo.get_size() for mo in memory_objs_layer)
 
             elif layer_id == self.num_layers:
                 yield

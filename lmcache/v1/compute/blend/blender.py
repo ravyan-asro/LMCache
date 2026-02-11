@@ -14,6 +14,7 @@
 
 # Standard
 from typing import Optional
+import os
 
 # Third Party
 import torch
@@ -40,6 +41,9 @@ class LMCBlender:
     ):
         self.cache_engine = cache_engine
         self.gpu_connector = gpu_connector
+        self.enable_layer_timing = (
+            os.getenv("LMCACHE_ENABLE_LAYER_TIMING", "0").lower() in {"1", "true"}
+        )
 
         self.layerwise_model = infer_model_from_vllm(vllm_model, self)
 
@@ -142,12 +146,36 @@ class LMCBlender:
         next(layerwise_retriever) # request layer 1 from storage backend
         yield
 
+        prev_start_evt = None
+        prev_end_evt = None
+
         for i in range(self.num_layers):
             next(layerwise_retriever) # request layer i+1 from storage backend
-            next(layerwise_model_executor) # compute layer i 
+            if self.enable_layer_timing and prev_start_evt is not None:
+                # GPU connector's sync inside send() has already waited for GPU compute
+                # of layer i-1, so prev layer's CUDA events are safe to read now.
+                prev_end_evt.synchronize()  # wait for end event; no-op if already reached
+                gpu_elapsed_ms = prev_start_evt.elapsed_time(prev_end_evt)
+                logger.info("GPU recompute layer %d: %.3f ms", i - 1, gpu_elapsed_ms)
+
+            if self.enable_layer_timing:
+                start_evt = torch.cuda.Event(enable_timing=True)
+                end_evt = torch.cuda.Event(enable_timing=True)
+                start_evt.record()
+            next(layerwise_model_executor) # compute layer i (blending + recompute), async
+            if self.enable_layer_timing:
+                end_evt.record()
+                prev_start_evt = start_evt
+                prev_end_evt = end_evt
             yield
 
+        # Final next() triggers the GPU connector sync for the last layer,
+        # after which the last layer's events are safe to read.
         next(layerwise_retriever)
+        if self.enable_layer_timing and prev_start_evt is not None:
+            prev_end_evt.synchronize()  # wait for end event; no-op if already reached
+            gpu_elapsed_ms = prev_start_evt.elapsed_time(prev_end_evt)
+            logger.info("GPU recompute layer %d: %.3f ms", self.num_layers - 1, gpu_elapsed_ms)
 
         self.metadata.clean()
         yield

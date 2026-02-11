@@ -557,7 +557,9 @@ class LMCacheEngine:
                 yield None
 
                 mem_objs_layer = [task.result() for task in tasks] # wait for the memory objects to be retrieved. This is the longest wait.
+
                 mem_obj_consumer.send(mem_objs_layer) # send the memory objects to the GPU connector
+
                 to_count_down.extend(mem_objs_layer) # count down the reference count of the memory objects
 
             # TODO(Jiayi): Need to be done in a modular way

@@ -264,7 +264,7 @@ class StorageManager:
 
         :return: A generator that yields a list of futures for each layer.
         """
-        for keys_multi_chunk in keys:
+        for layer_id, keys_multi_chunk in enumerate(keys):
             # Retrieve all chunks for one layer
             tasks = []
             for key in keys_multi_chunk:
@@ -272,6 +272,11 @@ class StorageManager:
                 assert task is not None
                 tasks.append(task)
             yield tasks
+            # After yield returns, cache_engine has called task.result() for all chunks
+            # — emit the per-layer aggregate disk read log.
+            for backend in self.storage_backends.values():
+                if hasattr(backend, "pop_and_log_layer_stats"):
+                    backend.pop_and_log_layer_stats(layer_id)
 
     # TODO(Jiayi): we need to consider eviction in prefetch
     def prefetch_callback(self, future, key):

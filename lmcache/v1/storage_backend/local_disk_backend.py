@@ -96,6 +96,12 @@ class LocalDiskBackend(StorageBackendInterface):
             self.use_direct_io, self.direct_io_block_size, self.path,
             self.bw_multiplier,
         )
+        self.enable_layer_timing = (
+            os.getenv("LMCACHE_ENABLE_LAYER_TIMING", "0").lower() in {"1", "true"}
+        )
+        # Per-layer read stats accumulator (thread-safe)
+        self._chunk_stats: list = []  # list of (t_start, t_end, total_bytes)
+        self._chunk_stats_lock = threading.Lock()
 
     def __str__(self):
         return self.__class__.__name__
@@ -108,6 +114,30 @@ class LocalDiskBackend(StorageBackendInterface):
         if self._libc is None:
             self._libc = ctypes.CDLL("libc.so.6")
         return self._libc
+
+    def pop_and_log_layer_stats(self, layer_id: int) -> None:
+        """Aggregate and log read stats collected across all chunks for one layer, then clear."""
+        if not self.enable_layer_timing:
+            return
+        with self._chunk_stats_lock:
+            stats = self._chunk_stats[:]
+            self._chunk_stats.clear()
+        if not stats:
+            return
+        t_start = min(s[0] for s in stats)
+        t_end = max(s[1] for s in stats)
+        total_bytes = sum(s[2] for s in stats)
+        elapsed = t_end - t_start
+        bw_gbs = total_bytes / elapsed / (1024 ** 3) if elapsed > 0 else float("inf")
+        logger.info(
+            "DiskRead layer %d: %.3f MB (%d chunks x%d) in %.3f ms => %.2f GB/s",
+            layer_id,
+            total_bytes / (1024 ** 2),
+            len(stats),
+            self.bw_multiplier,
+            elapsed * 1000,
+            bw_gbs,
+        )
 
     def _alloc_aligned_buffer(self, size: int) -> tuple[memoryview, ctypes.c_void_p]:
         libc = self._get_libc()
@@ -132,22 +162,12 @@ class LocalDiskBackend(StorageBackendInterface):
             fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
             remaining = padded_size
             offset = 0
-            t0 = time.perf_counter()
             while remaining > 0:
                 read = os.readv(fd, [buf_view[offset : offset + remaining]])
                 if read == 0:
                     break
                 offset += read
                 remaining -= read
-            elapsed = time.perf_counter() - t0
-            bw_gbs = padded_size / elapsed / (1024 ** 3) if elapsed > 0 else float("inf")
-            logger.info(
-                "DiskRead O_DIRECT: %.3f MB in %.3f ms => %.2f GB/s  [%s]",
-                padded_size / (1024 ** 2),
-                elapsed * 1000,
-                bw_gbs,
-                os.path.basename(path),
-            )
             memory_obj.byte_array.cast('B')[:size] = buf_view.cast('B')[:size]
         finally:
             if fd is not None:
@@ -462,7 +482,13 @@ class LocalDiskBackend(StorageBackendInterface):
                     )
                     for i in range(1, self.bw_multiplier)
                 ]
+                if self.enable_layer_timing:
+                    t_start = time.perf_counter()
                 await asyncio.gather(real_task, *dummy_tasks)
+                if self.enable_layer_timing:
+                    t_end = time.perf_counter()
+                    with self._chunk_stats_lock:
+                        self._chunk_stats.append((t_start, t_end, size * self.bw_multiplier))
             except OSError as e:
                 if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
                     logger.warning(
@@ -507,10 +533,16 @@ class LocalDiskBackend(StorageBackendInterface):
         size = memory_obj.get_size()
         if self.use_direct_io:
             try:
+                if self.enable_layer_timing:
+                    t_start = time.perf_counter()
                 self._read_direct_into(path, memory_obj, size)
                 # Dummy reads for BW simulation (sequential in blocking path)
                 for i in range(1, self.bw_multiplier):
                     self._read_direct_dummy(path + f".dup{i}", size)
+                if self.enable_layer_timing:
+                    t_end = time.perf_counter()
+                    with self._chunk_stats_lock:
+                        self._chunk_stats.append((t_start, t_end, size * self.bw_multiplier))
             except OSError as e:
                 if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
                     logger.warning(
