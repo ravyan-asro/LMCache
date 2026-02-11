@@ -88,9 +88,13 @@ class LocalDiskBackend(StorageBackendInterface):
             os.getenv("LMCACHE_LOCAL_DISK_DIRECT_IO_BLOCK_SIZE", "4096")
         )
         self._libc = None
+        self.bw_multiplier = int(
+            os.getenv("LMCACHE_DISK_BW_MULTIPLIER", "1")
+        )
         logger.info(
-            "LocalDiskBackend: use_direct_io=%s, block_size=%d, path=%s",
+            "LocalDiskBackend: use_direct_io=%s, block_size=%d, path=%s, bw_multiplier=%d",
             self.use_direct_io, self.direct_io_block_size, self.path,
+            self.bw_multiplier,
         )
 
     def __str__(self):
@@ -145,6 +149,26 @@ class LocalDiskBackend(StorageBackendInterface):
                 os.path.basename(path),
             )
             memory_obj.byte_array.cast('B')[:size] = buf_view.cast('B')[:size]
+        finally:
+            if fd is not None:
+                os.close(fd)
+            self._free_aligned_buffer(buf_ptr)
+
+    def _read_direct_dummy(self, path: str, size: int) -> None:
+        """Read a file into a scratch aligned buffer and discard (for BW simulation)."""
+        padded_size = self._round_up(size)
+        buf_view, buf_ptr = self._alloc_aligned_buffer(padded_size)
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            remaining = padded_size
+            offset = 0
+            while remaining > 0:
+                read = os.readv(fd, [buf_view[offset : offset + remaining]])
+                if read == 0:
+                    break
+                offset += read
+                remaining -= read
         finally:
             if fd is not None:
                 os.close(fd)
@@ -382,6 +406,12 @@ class LocalDiskBackend(StorageBackendInterface):
                 await asyncio.to_thread(
                     self._write_direct_from, path, memory_obj, len(byte_array)
                 )
+                # Write dummy copies for BW simulation
+                for i in range(1, self.bw_multiplier):
+                    dup_path = path + f".dup{i}"
+                    await asyncio.to_thread(
+                        self._write_direct_from, dup_path, memory_obj, len(byte_array)
+                    )
             except OSError as e:
                 if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
                     logger.warning(
@@ -420,11 +450,19 @@ class LocalDiskBackend(StorageBackendInterface):
         if memory_obj is None:
             logger.debug("Memory allocation failed during async disk load.")
             return None
+        size = memory_obj.get_size()
         if self.use_direct_io:
             try:
-                await asyncio.to_thread(
-                    self._read_direct_into, path, memory_obj, memory_obj.get_size()
+                real_task = asyncio.to_thread(
+                    self._read_direct_into, path, memory_obj, size
                 )
+                dummy_tasks = [
+                    asyncio.to_thread(
+                        self._read_direct_dummy, path + f".dup{i}", size
+                    )
+                    for i in range(1, self.bw_multiplier)
+                ]
+                await asyncio.gather(real_task, *dummy_tasks)
             except OSError as e:
                 if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
                     logger.warning(
@@ -444,13 +482,13 @@ class LocalDiskBackend(StorageBackendInterface):
             buffer = memory_obj.byte_array
             async with aiofiles.open(path, "rb") as f:
                 await f.readinto(buffer)
-        
+
         # Restore old_positions from metadata if available (same as CPU backend)
         if key is not None:
             with self.disk_lock:
                 if key in self.dict and self.dict[key].old_positions is not None:
                     memory_obj.metadata.old_positions = self.dict[key].old_positions
-        
+
         return memory_obj
 
     # TODO(Jiayi): use memory allocator to redeuce cpu buffer allocation
@@ -466,9 +504,13 @@ class LocalDiskBackend(StorageBackendInterface):
         if memory_obj is None:
             logger.debug("Memory allocation failed during async disk load.")
             return None
+        size = memory_obj.get_size()
         if self.use_direct_io:
             try:
-                self._read_direct_into(path, memory_obj, memory_obj.get_size())
+                self._read_direct_into(path, memory_obj, size)
+                # Dummy reads for BW simulation (sequential in blocking path)
+                for i in range(1, self.bw_multiplier):
+                    self._read_direct_dummy(path + f".dup{i}", size)
             except OSError as e:
                 if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
                     logger.warning(
@@ -488,13 +530,13 @@ class LocalDiskBackend(StorageBackendInterface):
             buffer = memory_obj.byte_array
             with open(path, "rb") as f:
                 f.readinto(buffer)
-        
+
         # Restore old_positions from metadata if available (same as CPU backend)
         if key is not None:
             with self.disk_lock:
                 if key in self.dict and self.dict[key].old_positions is not None:
                     memory_obj.metadata.old_positions = self.dict[key].old_positions
-        
+
         return memory_obj
 
     @_lmcache_nvtx_annotate
