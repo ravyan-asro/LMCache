@@ -264,13 +264,39 @@ class StorageManager:
 
         :return: A generator that yields a list of futures for each layer.
         """
+        # Check if any backend supports unified read
+        unified_backend = None
+        for backend in self.storage_backends.values():
+            if getattr(backend, "unified_read", False):
+                unified_backend = backend
+                break
+
         for layer_id, keys_multi_chunk in enumerate(keys):
-            # Retrieve all chunks for one layer
-            tasks = []
-            for key in keys_multi_chunk:
-                task = self.get_non_blocking(key)
-                assert task is not None
-                tasks.append(task)
+            if unified_backend is not None:
+                # Single-thread sequential read for all chunks
+                unified_future = unified_backend.submit_unified_prefetch_task(
+                    keys_multi_chunk
+                )
+
+                class _ChunkProxy:
+                    """Proxy that extracts one item from unified Future[List]."""
+                    def __init__(self, future, index):
+                        self._future = future
+                        self._index = index
+                    def result(self):
+                        return self._future.result()[self._index]
+
+                tasks = [
+                    _ChunkProxy(unified_future, i)
+                    for i in range(len(keys_multi_chunk))
+                ]
+            else:
+                # Default: parallel chunk reads
+                tasks = []
+                for key in keys_multi_chunk:
+                    task = self.get_non_blocking(key)
+                    assert task is not None
+                    tasks.append(task)
             yield tasks
             # After yield returns, cache_engine has called task.result() for all chunks
             # — emit the per-layer aggregate disk read log.

@@ -91,13 +91,16 @@ class LocalDiskBackend(StorageBackendInterface):
         self.bw_multiplier = int(
             os.getenv("LMCACHE_DISK_BW_MULTIPLIER", "1")
         )
-        logger.info(
-            "LocalDiskBackend: use_direct_io=%s, block_size=%d, path=%s, bw_multiplier=%d",
-            self.use_direct_io, self.direct_io_block_size, self.path,
-            self.bw_multiplier,
-        )
         self.enable_layer_timing = (
             os.getenv("LMCACHE_ENABLE_LAYER_TIMING", "0").lower() in {"1", "true"}
+        )
+        self.unified_read = (
+            os.getenv("LMCACHE_UNIFIED_READ", "0").lower() in {"1", "true"}
+        )
+        logger.info(
+            "LocalDiskBackend: use_direct_io=%s, block_size=%d, path=%s, bw_multiplier=%d, unified_read=%s",
+            self.use_direct_io, self.direct_io_block_size, self.path,
+            self.bw_multiplier, self.unified_read,
         )
         # Per-layer read stats accumulator (thread-safe)
         self._chunk_stats: list = []  # list of (t_start, t_end, total_bytes)
@@ -363,6 +366,64 @@ class LocalDiskBackend(StorageBackendInterface):
         assert shape is not None
         future = asyncio.run_coroutine_threadsafe(
             self.async_load_bytes_from_disk(path, dtype, shape, fmt, key), self.loop
+        )
+        return future
+
+    def _read_all_chunks_direct(
+        self,
+        chunk_infos: List[tuple],
+    ) -> List[MemoryObj]:
+        """Read all chunks sequentially in a single thread using O_DIRECT."""
+        results: List[MemoryObj] = []
+        for memory_obj, path, size in chunk_infos:
+            if self.enable_layer_timing:
+                t_start = time.perf_counter()
+            self._read_direct_into(path, memory_obj, size)
+            if self.enable_layer_timing:
+                t_end = time.perf_counter()
+                with self._chunk_stats_lock:
+                    self._chunk_stats.append((t_start, t_end, size))
+            results.append(memory_obj)
+        return results
+
+    async def async_unified_load_from_disk(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[MemoryObj]:
+        """Async wrapper: look up all keys, read all chunks in ONE thread."""
+        chunk_infos = []
+        with self.disk_lock:
+            for key in keys:
+                meta = self.dict[key]
+                self.evictor.update_on_hit(key, self.dict)
+                memory_obj = self.local_cpu_backend.allocate(
+                    meta.shape, meta.dtype, meta.fmt
+                )
+                assert memory_obj is not None
+                size = memory_obj.get_size()
+                chunk_infos.append((memory_obj, meta.path, size))
+
+        results = await asyncio.to_thread(
+            self._read_all_chunks_direct, chunk_infos
+        )
+
+        # Restore old_positions from disk metadata
+        for key, memory_obj in zip(keys, results, strict=False):
+            with self.disk_lock:
+                if key in self.dict and self.dict[key].old_positions is not None:
+                    memory_obj.metadata.old_positions = self.dict[key].old_positions
+
+        return results
+
+    def submit_unified_prefetch_task(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> Future:
+        """Submit all chunks for a layer as a single sequential read task."""
+        for key in keys:
+            logger.info(f"Prefetching {key} from disk (unified).")
+        future = asyncio.run_coroutine_threadsafe(
+            self.async_unified_load_from_disk(keys), self.loop
         )
         return future
 
