@@ -202,7 +202,7 @@ class LocalDiskBackend(StorageBackendInterface):
         buf_view, buf_ptr = self._alloc_aligned_buffer(padded_size)
         buf_view.cast('B')[:size] = memory_obj.byte_array.cast('B')[:size]
         if padded_size > size:
-            buf_view[size:padded_size] = b"\x00" * (padded_size - size)
+            buf_view.cast('B')[size:padded_size] = b"\x00" * (padded_size - size)
         fd = None
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT)
@@ -229,6 +229,11 @@ class LocalDiskBackend(StorageBackendInterface):
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
             if key not in self.dict:
+                if hasattr(key, 'layer_id') and key.layer_id == 0:
+                    logger.info(
+                        "disk contains MISS: hash=%s layer=%d, dict_size=%d",
+                        key.chunk_hash[:16], key.layer_id, len(self.dict),
+                    )
                 return False
             if pin:
                 self.dict[key].pin()
@@ -329,6 +334,14 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_lock.acquire()
         self.put_tasks.append(key)
         self.disk_lock.release()
+
+        if hasattr(key, 'layer_id') and key.layer_id == 0:
+            logger.info(
+                "submit_put_task: scheduling async write hash=%s layer=%d, "
+                "loop_running=%s, loop_closed=%s",
+                key.chunk_hash[:16], key.layer_id,
+                self.loop.is_running(), self.loop.is_closed(),
+            )
 
         future = asyncio.run_coroutine_threadsafe(
             self.async_save_bytes_to_disk(key, memory_obj), self.loop
@@ -473,51 +486,79 @@ class LocalDiskBackend(StorageBackendInterface):
         """
         Convert KV to bytes and async store bytes to disk.
         """
-        kv_chunk = memory_obj.tensor
-        assert kv_chunk is not None
-        byte_array = memory_obj.byte_array
-        path = self._key_to_path(key)
-
-        size = len(byte_array)
-        self.usage += size
-        self.stats_monitor.update_local_storage_usage(self.usage)
-
-        if self.use_direct_io:
-            try:
-                await asyncio.to_thread(
-                    self._write_direct_from, path, memory_obj, len(byte_array)
+        try:
+            is_layer0 = hasattr(key, 'layer_id') and key.layer_id == 0
+            if is_layer0:
+                logger.info(
+                    "async_save START: hash=%s layer=%d",
+                    key.chunk_hash[:16], key.layer_id,
                 )
-                # Write dummy copies for BW simulation
-                for i in range(1, self.bw_multiplier):
-                    dup_path = path + f".dup{i}"
+
+            kv_chunk = memory_obj.tensor
+            assert kv_chunk is not None
+            byte_array = memory_obj.byte_array
+            path = self._key_to_path(key)
+
+            size = len(byte_array)
+            self.usage += size
+            self.stats_monitor.update_local_storage_usage(self.usage)
+
+            if self.use_direct_io:
+                try:
                     await asyncio.to_thread(
-                        self._write_direct_from, dup_path, memory_obj, len(byte_array)
+                        self._write_direct_from, path, memory_obj, len(byte_array)
                     )
-            except OSError as e:
-                if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
+                    # Write dummy copies for BW simulation
+                    for i in range(1, self.bw_multiplier):
+                        dup_path = path + f".dup{i}"
+                        await asyncio.to_thread(
+                            self._write_direct_from, dup_path, memory_obj, len(byte_array)
+                        )
+                except OSError as e:
+                    if e.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
+                        logger.warning(
+                            "Direct I/O unsupported for %s; falling back to buffered I/O.",
+                            path,
+                        )
+                    else:
+                        raise
                     logger.warning(
                         "Direct I/O unsupported for %s; falling back to buffered I/O.",
                         path,
                     )
-                else:
-                    raise
-                logger.warning(
-                    "Direct I/O unsupported for %s; falling back to buffered I/O.",
-                    path,
-                )
+                    async with aiofiles.open(path, "wb") as f:
+                        await f.write(byte_array)
+            else:
                 async with aiofiles.open(path, "wb") as f:
                     await f.write(byte_array)
-        else:
-            async with aiofiles.open(path, "wb") as f:
-                await f.write(byte_array)
 
-        self.insert_key(key, memory_obj)
+            if is_layer0:
+                logger.info(
+                    "async_save WRITTEN: hash=%s layer=%d, path=%s",
+                    key.chunk_hash[:16], key.layer_id, path,
+                )
 
-        memory_obj.ref_count_down()
+            self.insert_key(key, memory_obj)
 
-        self.disk_lock.acquire()
-        self.put_tasks.remove(key)
-        self.disk_lock.release()
+            if is_layer0:
+                logger.info(
+                    "async_save DONE: hash=%s layer=%d, dict_size=%d",
+                    key.chunk_hash[:16], key.layer_id, len(self.dict),
+                )
+
+            memory_obj.ref_count_down()
+
+            self.disk_lock.acquire()
+            self.put_tasks.remove(key)
+            self.disk_lock.release()
+        except Exception as e:
+            logger.error(
+                "async_save EXCEPTION: hash=%s, error=%s",
+                key.chunk_hash[:16] if hasattr(key, 'chunk_hash') else "?",
+                str(e),
+            )
+            import traceback
+            logger.error("async_save traceback: %s", traceback.format_exc())
 
     # TODO(Jiayi): use `bytes_read = await f.readinto(buffer)`
     # for better performance (i.e., fewer copy)

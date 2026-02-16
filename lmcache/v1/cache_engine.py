@@ -278,13 +278,20 @@ class LMCacheEngine:
         memory_objs = []
         tot_token_num = 0
         kv_dtype = self.metadata.kv_dtype
+        segment_count = 0
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             assert isinstance(key, CacheEngineKey)
+            segment_count += 1
+            logger.info(
+                "store_layer segment %d: start=%d end=%d hash=%s worker=%d",
+                segment_count, start, end, key.chunk_hash[:16], key.worker_id,
+            )
 
             keys_multi_layer = key.split_layers(self.num_layers)
 
             # Only check the first layer
             if self.storage_manager.contains(keys_multi_layer[0]):
+                logger.info("store_layer segment %d: SKIPPED (already exists)", segment_count)
                 continue
 
             # Allocate the memory object
@@ -315,6 +322,10 @@ class LMCacheEngine:
             if self.lookup_server is not None:
                 self.lookup_server.batched_insert(keys_multi_layer)
 
+        logger.info(
+            "store_layer: %d segments found, %d new keys to store, total %d tokens",
+            segment_count, len(keys), tot_token_num,
+        )
         if keys:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
@@ -630,21 +641,40 @@ class LMCacheEngine:
         # secondary lookup on p2p (via lookup_server) if enabled
         search_p2p = self.enable_p2p and (search_range is None or "p2p" in search_range)
 
+        logger.info(
+            "lookup: checking %d tokens, worker_id=%d, world_size=%d",
+            len(tokens), self.metadata.worker_id, self.metadata.world_size,
+        )
+
+        segment_idx = 0
         for start, end, key in self.token_database.process_tokens(tokens):
             assert isinstance(key, CacheEngineKey)
+            segment_idx += 1
 
             if self.use_layerwise:
                 # TODO(Jiayi): Optimize by checking only the existence of the key
                 # of one layer
                 key_all_layers = key.split_layers(self.num_layers)
-                for key_single_layer in key_all_layers:
+                found_all = True
+                for layer_idx, key_single_layer in enumerate(key_all_layers):
                     if not self.storage_manager.contains(
                         key_single_layer, search_range, pin
                     ):
                         if search_p2p and self.lookup_server.lookup(key_single_layer):
                             continue
+                        logger.info(
+                            "lookup: segment %d MISS at layer %d, hash=%s, "
+                            "start=%d end=%d, returning old_end=%d",
+                            segment_idx, layer_idx, key.chunk_hash[:16],
+                            start, end, old_end,
+                        )
                         return old_end
                 old_end = end
+                if segment_idx <= 3:
+                    logger.info(
+                        "lookup: segment %d HIT, hash=%s, start=%d end=%d",
+                        segment_idx, key.chunk_hash[:16], start, end,
+                    )
             else:
                 if self.storage_manager.contains(key, search_range, pin):
                     old_end = end
