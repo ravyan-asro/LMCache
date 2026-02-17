@@ -128,7 +128,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> tuple[Optional[int], bool]:
+    ) -> tuple[int, bool]:
         """
         Get number of new tokens that can be loaded from the
         external KV cache beyond the num_computed_tokens.
@@ -146,7 +146,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         num_tokens = self._lmcache_engine.get_num_new_matched_tokens(
             request, num_computed_tokens
         )
-        return (num_tokens if num_tokens > 0 else None), False
+        # Return 0 (not None) for cache miss — None means "indeterminate"
+        # which causes the scheduler to skip and retry indefinitely.
+        return num_tokens, False
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

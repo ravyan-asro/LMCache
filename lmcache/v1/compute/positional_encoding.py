@@ -181,15 +181,16 @@ def get_fused_rope(
         )
         return None
 
+    # Build rope_parameters dict for vLLM 0.15+ API
+    rope_params = {"rope_theta": base, "partial_rotary_factor": partial_rotary_factor}
+    if rope_scaling is not None:
+        rope_params.update(rope_scaling)
     rope = vllm_get_rope(
         head_size,
-        rotary_dim,
         max_position,
-        base,
         is_neox_style,
-        rope_scaling,
-        dtype,
-        partial_rotary_factor,
+        rope_parameters=rope_params,
+        dtype=dtype,
     )
 
     reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)

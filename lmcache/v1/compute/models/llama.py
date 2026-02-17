@@ -69,7 +69,10 @@ class LMCLlamaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
     ):
-        hidden_states = self.vllm_model.get_input_embeddings(input_ids.cuda())
+        # vLLM 0.15+: get_input_embeddings → embed_input_ids
+        embed_fn = getattr(self.vllm_model, 'embed_input_ids',
+                           getattr(self.vllm_model, 'get_input_embeddings', None))
+        hidden_states = embed_fn(input_ids.cuda())
         residual = None
 
         # TODO (Jiayi): reduce the number of calls

@@ -302,6 +302,7 @@ class LMCacheConnectorV1Impl:
         parent: KVConnectorBase_V1,
     ):
         self._parent = parent
+        self._vllm_config = vllm_config
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         is_tp = vllm_config.parallel_config.tensor_parallel_size > 1
 
@@ -398,11 +399,11 @@ class LMCacheConnectorV1Impl:
         # is called, but VLLMModelTracker.register_model() was removed
         # from gpu_worker.py. We find it via gc inspection.
         import gc
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunnerV1
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
         model = None
         for obj in gc.get_objects():
-            if isinstance(obj, GPUModelRunnerV1) and hasattr(obj, 'model'):
+            if isinstance(obj, GPUModelRunner) and hasattr(obj, 'model'):
                 model = obj.model
                 break
 
@@ -414,11 +415,14 @@ class LMCacheConnectorV1Impl:
 
         logger.info("Registering vLLM model with VLLMModelTracker for blending")
         VLLMModelTracker.register_model(ENGINE_NAME, model)
-        self.blender = LMCBlenderBuilder.get_or_create(
-            ENGINE_NAME,
-            self.lmcache_engine,
-            self.lmcache_engine.gpu_connector,
-        )
+        # Blender creation calls get_rope() which needs the vLLM config context
+        from vllm.config.vllm import set_current_vllm_config
+        with set_current_vllm_config(self._vllm_config):
+            self.blender = LMCBlenderBuilder.get_or_create(
+                ENGINE_NAME,
+                self.lmcache_engine,
+                self.lmcache_engine.gpu_connector,
+            )
 
     ####################
     # Worker side APIs
