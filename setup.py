@@ -71,13 +71,16 @@ def cuda_extension() -> tuple[list, dict]:
         "csrc/ac_dec.cu",
         "csrc/pos_kernels.cu",
     ]
+    # Match torch's C++ ABI setting (torch 2.9+ uses CXX11 ABI=1)
+    import torch
+    abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}"
     ext_modules = [
         cpp_extension.CUDAExtension(
             "lmcache.c_ops",
             sources=cuda_sources,
             extra_compile_args={
-                "cxx": ["-D_GLIBCXX_USE_CXX11_ABI=0"],
-                "nvcc": ["-D_GLIBCXX_USE_CXX11_ABI=0"],
+                "cxx": [abi_flag],
+                "nvcc": [abi_flag],
             },
         ),
     ]

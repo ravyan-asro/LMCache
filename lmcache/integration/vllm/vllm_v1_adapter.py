@@ -23,7 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
-from vllm.utils import cdiv
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
 import torch
 
@@ -37,11 +37,12 @@ from lmcache.integration.vllm.vllm_adapter import init_lmcache_engine
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend import LMCBlenderBuilder
+from lmcache.v1.compute.models.utils import VLLMModelTracker
 from lmcache.v1.lookup_client import LookupClientFactory
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.v1.attention.backend import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -129,8 +130,8 @@ class RequestTracker:
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=lmcache_cached_tokens,
-            mm_hashes=new_request.mm_hashes.copy(),
-            mm_positions=new_request.mm_positions.copy(),
+            mm_hashes=getattr(new_request, 'mm_hashes', []).copy() if getattr(new_request, 'mm_hashes', None) else [],
+            mm_positions=getattr(new_request, 'mm_positions', []).copy() if getattr(new_request, 'mm_positions', None) else [],
         )
 
     def update(
@@ -322,13 +323,10 @@ class LMCacheConnectorV1Impl:
 
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
-
-            if self.enable_blending:
-                self.blender = LMCBlenderBuilder.get_or_create(
-                    ENGINE_NAME,
-                    self.lmcache_engine,
-                    self.lmcache_engine.gpu_connector,
-                )
+            # Blender creation is deferred to start_load_kv() because in
+            # vLLM 0.15+ the connector is initialized before the model
+            # is registered with VLLMModelTracker.
+            self.blender = None
 
             # Create lookup server using factory
             assert self.lmcache_engine is not None
@@ -366,6 +364,12 @@ class LMCacheConnectorV1Impl:
         )
         self.current_layer = 0
 
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """Register KV caches directly (called after model load in vLLM 0.15+)."""
+        logger.info("Registering KV caches")
+        assert len(self.kv_caches) == 0 and len(kv_caches) > 0
+        self.kv_caches = kv_caches
+
     def _init_kv_caches_from_forward_context(self, forward_context: "ForwardContext"):
         for layer_name in forward_context.no_compile_layers:
             attn_layer = forward_context.no_compile_layers[layer_name]
@@ -377,6 +381,44 @@ class LMCacheConnectorV1Impl:
                 self.kv_caches[layer_name] = attn_layer.kv_cache[
                     forward_context.virtual_engine
                 ]
+
+    def _ensure_blender(self, forward_context: "ForwardContext"):
+        """Lazily initialize the blender on first use.
+
+        In vLLM 0.15+, the connector is created before the model is
+        registered with VLLMModelTracker. We defer blender creation
+        until start_load_kv(), where we can find the model via the
+        GPUModelRunnerV1 instance in the current worker process.
+        """
+        if self.blender is not None or not self.enable_blending:
+            return
+
+        # Find the vLLM model from the model runner in this worker process.
+        # In vLLM 0.15+, the model is already loaded when start_load_kv
+        # is called, but VLLMModelTracker.register_model() was removed
+        # from gpu_worker.py. We find it via gc inspection.
+        import gc
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunnerV1
+
+        model = None
+        for obj in gc.get_objects():
+            if isinstance(obj, GPUModelRunnerV1) and hasattr(obj, 'model'):
+                model = obj.model
+                break
+
+        if model is None:
+            raise RuntimeError(
+                "Could not find vLLM model for blender initialization. "
+                "Ensure the model is loaded before the first forward pass."
+            )
+
+        logger.info("Registering vLLM model with VLLMModelTracker for blending")
+        VLLMModelTracker.register_model(ENGINE_NAME, model)
+        self.blender = LMCBlenderBuilder.get_or_create(
+            ENGINE_NAME,
+            self.lmcache_engine,
+            self.lmcache_engine.gpu_connector,
+        )
 
     ####################
     # Worker side APIs
@@ -400,6 +442,10 @@ class LMCacheConnectorV1Impl:
         if len(self.kv_caches) == 0:
             self._init_kv_caches_from_forward_context(forward_context)
 
+        # Lazily initialize blender on first call (needs model from forward_context)
+        if self.enable_blending and self.blender is None:
+            self._ensure_blender(forward_context)
+
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
@@ -407,8 +453,9 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
 
         attn_metadata = forward_context.attn_metadata
-        if attn_metadata is None:
-            logger.warning("In connector.start_load_kv, but the attn_metadata is None")
+        # In vLLM 0.15+, attn_metadata can be dict or list[dict]
+        if attn_metadata is None or (isinstance(attn_metadata, list) and len(attn_metadata) == 0):
+            logger.warning("In connector.start_load_kv, but the attn_metadata is None/empty")
             return
 
         assert self.lmcache_engine is not None
@@ -714,9 +761,12 @@ class LMCacheConnectorV1Impl:
         token_ids = torch.tensor(request.prompt_token_ids)
 
         # If the request has multimodal hashes, apply them to the token ids
-        if request.mm_hashes:
+        # (mm_hashes was renamed to mm_features in vLLM 0.15+)
+        mm_hashes = getattr(request, 'mm_hashes', None)
+        if mm_hashes:
+            mm_positions = getattr(request, 'mm_positions', None)
             apply_mm_hashes_to_token_ids(
-                token_ids, request.mm_hashes, request.mm_positions
+                token_ids, mm_hashes, mm_positions
             )
 
         if self.skip_last_n_tokens > 0:
@@ -903,7 +953,7 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        params = request.kv_transfer_params
+        params = getattr(request, 'kv_transfer_params', None)
         return_params = None
 
         # NOTE: Used to stream back the first token

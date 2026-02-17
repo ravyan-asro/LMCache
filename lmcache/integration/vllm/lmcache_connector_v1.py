@@ -19,7 +19,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.v1.attention.backend import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
@@ -28,9 +28,16 @@ logger = init_logger(__name__)
 
 
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config=vllm_config, role=role)
+    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole,
+                 kv_cache_config=None):
+        super().__init__(vllm_config=vllm_config, role=role,
+                         kv_cache_config=kv_cache_config)
         self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """Register KV caches after model load."""
+        if hasattr(self._lmcache_engine, "register_kv_caches"):
+            self._lmcache_engine.register_kv_caches(kv_caches)
 
     # ==============================
     # Worker-side methods
@@ -121,7 +128,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[Optional[int], bool]:
         """
         Get number of new tokens that can be loaded from the
         external KV cache beyond the num_computed_tokens.
@@ -133,11 +140,13 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
 
         Returns:
             the number of tokens that can be loaded from the
-            external KV cache beyond what is already computed.
+            external KV cache beyond what is already computed,
+            or None if no match. Second element is uncertainty flag.
         """
-        return self._lmcache_engine.get_num_new_matched_tokens(
+        num_tokens = self._lmcache_engine.get_num_new_matched_tokens(
             request, num_computed_tokens
-        ), False
+        )
+        return (num_tokens if num_tokens > 0 else None), False
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

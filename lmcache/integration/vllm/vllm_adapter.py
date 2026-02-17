@@ -27,12 +27,12 @@ if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
 
 # Third Party
-from vllm.attention import AttentionMetadata
+from vllm.v1.attention.backend import AttentionMetadata
 
 # from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 try:
     # Third Party
-    from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 except (ModuleNotFoundError, ImportError):
     # vllm_flash_attn is not installed, try the ROCm FA metadata
     from vllm.attention.backends.rocm_flash_attn import (
@@ -40,8 +40,8 @@ except (ModuleNotFoundError, ImportError):
     )
 
 # Third Party
-from vllm.attention.backends.flashmla import FlashMLAMetadata
-from vllm.attention.backends.mla.common import MLACommonMetadata
+from vllm.v1.attention.backends.mla.flashmla import FlashMLAMetadata
+from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -49,7 +49,8 @@ from vllm.config import (
     SchedulerConfig,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.utils import cdiv, get_kv_cache_torch_dtype, round_down
+from vllm.utils.math_utils import cdiv, round_down
+from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
@@ -995,7 +996,14 @@ def build_partial_prefill_input(
 
     # import here to avoid circular import.
     # Third Party
-    from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
+    # NOTE: This is V0 API - may not exist in vLLM >= 0.15
+    try:
+        from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
+    except ImportError:
+        raise ImportError(
+            "ModelInputForGPUWithSamplingMetadata not available in this vLLM version. "
+            "This V0 code path is not supported with vLLM >= 0.15."
+        )
 
     rebuilt_model_input = ModelInputForGPUWithSamplingMetadata(
         input_tokens=torch.cat(rebuilt_input_tokens).to(device),
@@ -1103,7 +1111,7 @@ def build_mla_params(
     # set decode params
     if attention_mata.num_decode_tokens > 0:
         # Third Party
-        from vllm.attention.ops.flashmla import get_mla_metadata
+        from vllm.third_party.flashmla.flash_mla_interface import get_mla_metadata
 
         num_q_heads = VLLM_MODEL_CONFIG.get_num_attention_heads(VLLM_PARALLEL_CONFIG)
         (

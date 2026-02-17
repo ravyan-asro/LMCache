@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Third Party
-from vllm.attention import Attention
+from vllm.attention.layer import Attention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata
 import torch
@@ -37,8 +37,8 @@ class LMCFlashAttnBackend(AttentionInterface):
         self.vllm_attn = vllm_attn
         self.vllm_attn_impl: FlashAttentionImpl = vllm_attn.impl
 
-        # TODO(Jiayi): remove this hardcode
-        self.aot_schedule = False
+        # Inherit AOT scheduling from vLLM (True for FA3 on Hopper/H200)
+        self.aot_schedule = getattr(self.vllm_attn_impl, 'aot_schedule', False)
 
     def forward_contiguous(
         self,
