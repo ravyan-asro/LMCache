@@ -50,12 +50,34 @@ class LMCBlender:
         # TODO: remove this hardcode
         self.num_layers = len(vllm_model.model.layers)
 
-        # TODO (Jiayi): make this less hard-coded
-        self.common_metadata = LMCBlendCommonMetadata(
-            check_layers=[1],
-            recomp_ratios=[0.15],
-            thresholds=None,
+        # EPIC mode: static first-N-tokens-per-chunk recompute
+        self.epic_mode = (
+            os.getenv("LMCACHE_EPIC_MODE", "0").lower() in {"1", "true"}
         )
+        self.epic_tokens_per_chunk = int(
+            os.getenv("LMCACHE_EPIC_TOKENS_PER_CHUNK", "64")
+        )
+
+        if self.epic_mode:
+            logger.info(
+                "EPIC mode enabled: static %d tokens/chunk recompute, "
+                "partial recompute in ALL layers (including 0 and 1)",
+                self.epic_tokens_per_chunk,
+            )
+            # EPIC uses static selection — no dynamic check layers needed
+            self.common_metadata = LMCBlendCommonMetadata(
+                check_layers=[],
+                recomp_ratios=[],
+                thresholds=None,
+            )
+        else:
+            blend_ratio = float(os.getenv("BLEND_RECOMPUTE_RATIO", "0.15"))
+            logger.info("CacheBlend recompute ratio: %.4f", blend_ratio)
+            self.common_metadata = LMCBlendCommonMetadata(
+                check_layers=[1],
+                recomp_ratios=[blend_ratio],
+                thresholds=None,
+            )
 
         # This will be set during the blending process
         self.metadata = LMCBlendMetadata(
@@ -63,6 +85,20 @@ class LMCBlender:
             attn_mask=None,
             positions=None,
         )
+
+    def _compute_epic_indices(self, device: torch.device) -> torch.Tensor:
+        """Compute static EPIC indices: first N tokens of each cached chunk."""
+        chunk_starts = getattr(self.gpu_connector, "chunk_starts", None)
+        chunk_ends = getattr(self.gpu_connector, "chunk_ends", None)
+        if not chunk_starts or not chunk_ends:
+            return torch.tensor([], device=device, dtype=torch.int64)
+
+        indices = []
+        for s, e in zip(chunk_starts, chunk_ends):
+            n = min(self.epic_tokens_per_chunk, e - s)
+            indices.extend(range(s, s + n))
+
+        return torch.tensor(indices, device=device, dtype=torch.int64)
 
     def process_qkv(
         self,
@@ -93,7 +129,35 @@ class LMCBlender:
         attn_layer = layer.self_attn
         q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
 
-        if layer_id in self.common_metadata.check_layers:
+        # ---- EPIC: static first-N-per-chunk selection at layer 0 ----
+        # Sets imp_indices once; layers 0, 1, 2+ all then follow the
+        # same imp_indices path that CacheBlend layers ≥2 already use.
+        if self.epic_mode and layer_id == 0:
+            top_indices = self._compute_epic_indices(q.device)
+            topk_num = top_indices.shape[0]
+            logger.info(
+                "EPIC layer 0: selecting %d static tokens "
+                "(%d tokens/chunk × %d chunks)",
+                topk_num,
+                self.epic_tokens_per_chunk,
+                len(self.gpu_connector.chunk_starts),
+            )
+
+            k, v = k[top_indices], v[top_indices]
+            q = q[top_indices]
+            residual = residual[top_indices]
+
+            self.metadata.imp_indices = top_indices
+            self.metadata.positions = self.metadata.positions[top_indices]
+            attn_output = attn_output[:topk_num]
+
+            attn_metadata.max_query_len = topk_num
+            attn_metadata.query_start_loc = torch.tensor(
+                [0, topk_num], dtype=torch.int32, device=q.device
+            )
+
+        # ---- Original CacheBlend: dynamic top-k at check_layers ----
+        elif layer_id in self.common_metadata.check_layers:
             diff_k = torch.sum(
                 (k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1]
             )

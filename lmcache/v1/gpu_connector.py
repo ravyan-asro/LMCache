@@ -384,6 +384,10 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             token sequence.
         """
 
+        # Expose chunk boundaries so the blender can use them (e.g. EPIC mode)
+        self.chunk_starts = list(starts)
+        self.chunk_ends = list(ends)
+
         if "kvcaches" not in kwargs:
             raise ValueError("'kvcaches' should be provided in kwargs.")
 
