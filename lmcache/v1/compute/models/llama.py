@@ -47,14 +47,14 @@ class LMCLlamaModel(nn.Module):
         # if we want to make this LMCModel more general.
         self.blender = blender
 
-        # remove hard code
         rotary_emb = vllm_model.model.layers[0].self_attn.rotary_emb
         head_dim = rotary_emb.head_size
         max_position_embeddings = rotary_emb.max_position_embeddings
-        rope_scaling = None
         base = rotary_emb.base
         is_neox_style = rotary_emb.is_neox_style
         dtype = rotary_emb.dtype
+
+        rope_scaling = getattr(vllm_model.config, 'rope_scaling', None)
         self.fused_rotary_emb = get_fused_rope(
             head_dim,
             rotary_dim=head_dim,

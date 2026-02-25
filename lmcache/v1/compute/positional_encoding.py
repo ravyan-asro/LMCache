@@ -106,9 +106,9 @@ def validate_rope_params(
         logger.error("Currently KV blending only support rotary_dim == head_size.")
         return False
 
-    if rope_scaling is not None:
-        logger.error("Currently KV blending do not support rope scaling.")
-        return False
+    #if rope_scaling is not None:
+    #    logger.error("Currently KV blending do not support rope scaling.")
+    #    return False
 
     if partial_rotary_factor != 1.0:
         logger.error(

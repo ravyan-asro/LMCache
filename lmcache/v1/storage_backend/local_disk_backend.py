@@ -373,7 +373,7 @@ class LocalDiskBackend(StorageBackendInterface):
         shape = self.dict[key].shape
         fmt = self.dict[key].fmt
         self.disk_lock.release()
-        logger.info(f"Prefetching {key} from disk.")
+        #logger.info(f"Prefetching {key} from disk.")
 
         assert dtype is not None
         assert shape is not None
@@ -433,8 +433,8 @@ class LocalDiskBackend(StorageBackendInterface):
         keys: List[CacheEngineKey],
     ) -> Future:
         """Submit all chunks for a layer as a single sequential read task."""
-        for key in keys:
-            logger.info(f"Prefetching {key} from disk (unified).")
+        #for key in keys:
+        #    logger.info(f"Prefetching {key} from disk (unified).")
         future = asyncio.run_coroutine_threadsafe(
             self.async_unified_load_from_disk(keys), self.loop
         )
