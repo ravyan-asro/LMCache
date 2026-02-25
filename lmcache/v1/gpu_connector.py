@@ -427,6 +427,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert compute_gpu_buffer_obj.tensor is not None
         assert load_gpu_buffer_obj.tensor is not None
 
+        # Zero-initialize buffers so that positions between chunks
+        # (e.g. separator tokens) always start as zeros rather than
+        # retaining stale KV data from a previous blend operation.
+        compute_gpu_buffer_obj.tensor.zero_()
+        load_gpu_buffer_obj.tensor.zero_()
+
         # current_stream = torch.cuda.current_stream()
 
         if self.cache_positions:
