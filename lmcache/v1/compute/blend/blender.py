@@ -18,6 +18,7 @@ import os
 
 # Third Party
 import torch
+import torch.cuda.nvtx as nvtx
 
 # First Party
 from lmcache.logging import init_logger
@@ -226,7 +227,9 @@ class LMCBlender:
                 start_evt = torch.cuda.Event(enable_timing=True)
                 end_evt = torch.cuda.Event(enable_timing=True)
                 start_evt.record()
+            nvtx.range_push(f"GPURecompute_L{i}")
             next(layerwise_model_executor) # compute layer i (blending + recompute), async
+            nvtx.range_pop()
             if self.enable_layer_timing:
                 end_evt.record()
                 prev_start_evt = start_evt

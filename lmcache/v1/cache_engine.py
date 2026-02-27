@@ -20,6 +20,7 @@ import time
 
 # Third Party
 import torch
+import torch.cuda.nvtx as nvtx
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
@@ -567,7 +568,9 @@ class LMCacheEngine:
 
                 yield None
 
+                nvtx.range_push(f"DiskWait_L{layer_id}")
                 mem_objs_layer = [task.result() for task in tasks] # wait for the memory objects to be retrieved. This is the longest wait.
+                nvtx.range_pop()
 
                 mem_obj_consumer.send(mem_objs_layer) # send the memory objects to the GPU connector
 

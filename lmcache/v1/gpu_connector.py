@@ -19,6 +19,7 @@ import os
 
 # Third Party
 import torch
+import torch.cuda.nvtx as nvtx
 
 # First Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -444,6 +445,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         h2d_prev_bytes = 0
         for layer_id in range(self.num_layers + 2):
             if layer_id > 1:
+                nvtx.range_push(f"KVTransfer_L{layer_id - 2}")
                 lmc_ops.single_layer_kv_transfer(
                     self.buffer_mapping[layer_id - 2].tensor,
                     kvcaches[layer_id - 2][0],
@@ -452,13 +454,16 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     False,
                     False,  # shape is [2, num_tokens, hidden_dim]
                 )
+                nvtx.range_pop()
                 del self.buffer_mapping[layer_id - 2]
 
                 logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
 
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
+                nvtx.range_push(f"Sync_L{layer_id}")
                 torch.cuda.synchronize()
+                nvtx.range_pop()
 
                 if self.enable_layer_timing and h2d_prev_start_evt is not None:
                     # synchronize() above guarantees load_stream events are done
@@ -481,11 +486,13 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 if self.cache_positions:
                     assert compute_gpu_buffer_obj.tensor is not None
 
+                    nvtx.range_push(f"RoPE_L{layer_id - 1}")
                     compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
                         old_positions_full,
                         new_positions_full,
                         compute_gpu_buffer_obj.tensor[0],
                     )
+                    nvtx.range_pop()
 
                 self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
@@ -496,6 +503,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
                 # memobj -> gpu_buffer
                 with torch.cuda.stream(self.load_stream):
+                    nvtx.range_push(f"H2D_L{layer_id}")
                     if self.enable_layer_timing:
                         h2d_start_evt = torch.cuda.Event(enable_timing=True)
                         h2d_end_evt = torch.cuda.Event(enable_timing=True)
@@ -522,6 +530,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         h2d_prev_start_evt = h2d_start_evt
                         h2d_prev_end_evt = h2d_end_evt
                         h2d_prev_bytes = sum(mo.get_size() for mo in memory_objs_layer)
+                    nvtx.range_pop()
 
             elif layer_id == self.num_layers:
                 yield
