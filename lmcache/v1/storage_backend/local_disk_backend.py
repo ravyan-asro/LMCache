@@ -275,6 +275,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_lock.release()
         size = os.path.getsize(path)
         self.usage -= size
+        self.evictor.current_cache_size -= size
         self.stats_monitor.update_local_storage_usage(self.usage)
         os.remove(path)
 
@@ -709,4 +710,6 @@ class LocalDiskBackend(StorageBackendInterface):
             clear_keys = list(self.dict.keys())
         for key in clear_keys:
             self.remove(key)
+        # Reset evictor's size counter so it matches the now-empty disk
+        self.evictor.current_cache_size = 0
         return len(clear_keys)
