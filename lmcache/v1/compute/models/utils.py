@@ -41,6 +41,13 @@ def infer_model_from_vllm(vllm_model, blender):
         )
 
 
+def infer_indexcache_model_from_vllm(vllm_model, config):
+    """Create an LMCIndexCacheLlamaModel from a vLLM model."""
+    from lmcache.v1.compute.models.indexcache_llama import LMCIndexCacheLlamaModel
+
+    return LMCIndexCacheLlamaModel(vllm_model, config)
+
+
 class VLLMModelTracker:
     _vllm_models: Dict[str, nn.Module] = {}
 

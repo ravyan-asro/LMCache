@@ -36,7 +36,7 @@ from lmcache.integration.vllm.utils import (
 from lmcache.integration.vllm.vllm_adapter import init_lmcache_engine
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
-from lmcache.v1.compute.blend import LMCBlenderBuilder
+from lmcache.v1.compute.blend import IndexCacheBlenderBuilder, LMCBlenderBuilder
 from lmcache.v1.lookup_client import LookupClientFactory
 
 if TYPE_CHECKING:
@@ -312,6 +312,15 @@ class LMCacheConnectorV1Impl:
                 role, is_tp, vllm_config
             )
             self._requests_in_step: dict[str, Request] = {}
+
+            # IndexCache: scheduler needs lookup access to metadata
+            # (works with VLLM_ENABLE_V1_MULTIPROCESSING=0 where
+            # worker and scheduler share the same process)
+            import os
+            self.enable_indexcache = (
+                os.environ.get("LMCACHE_INDEXCACHE_MODE", "0") == "1"
+            )
+            self._indexcache_blender_ref = None
         else:
             self.lmcache_engine = init_lmcache_engine(
                 vllm_config.model_config,
@@ -329,6 +338,23 @@ class LMCacheConnectorV1Impl:
                     self.lmcache_engine,
                     self.lmcache_engine.gpu_connector,
                 )
+
+            # IndexCache mode — completely separate from CacheBlend
+            import os
+            self.enable_indexcache = (
+                os.environ.get("LMCACHE_INDEXCACHE_MODE", "0") == "1"
+            )
+            self.indexcache_blender = None
+            if self.enable_indexcache:
+                from lmcache.v1.compute.indexcache.config import IndexCacheConfig
+
+                ic_config = IndexCacheConfig.from_env()
+                self.indexcache_blender = (
+                    IndexCacheBlenderBuilder.get_or_create(
+                        ENGINE_NAME, ic_config
+                    )
+                )
+                logger.info("IndexCache mode enabled")
 
             # Create lookup server using factory
             assert self.lmcache_engine is not None
@@ -436,6 +462,20 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+
+            # IndexCache: lean_attn prefill → write KV to paged buffer
+            if (
+                getattr(self, "enable_indexcache", False)
+                and self.indexcache_blender is not None
+            ):
+                self.indexcache_blender.blend(
+                    tokens[:lmcache_cached_tokens],
+                    token_mask[:lmcache_cached_tokens],
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                )
+                continue
+
             if self.use_layerwise:
                 sync = True
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
@@ -719,7 +759,23 @@ class LMCacheConnectorV1Impl:
                 token_ids, request.mm_hashes, request.mm_positions
             )
 
-        if self.skip_last_n_tokens > 0:
+        # IndexCache: check metadata store instead of LMCache storage
+        # (lazy lookup — blender created by worker-side, shared in-process)
+        if getattr(self, "enable_indexcache", False):
+            if self._indexcache_blender_ref is None:
+                try:
+                    self._indexcache_blender_ref = (
+                        IndexCacheBlenderBuilder.get(ENGINE_NAME)
+                    )
+                except ValueError:
+                    pass
+            if self._indexcache_blender_ref is not None:
+                num_external_hit_tokens = (
+                    self._indexcache_blender_ref.lookup(token_ids)
+                )
+            else:
+                num_external_hit_tokens = 0
+        elif self.skip_last_n_tokens > 0:
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids[: -self.skip_last_n_tokens]
             )

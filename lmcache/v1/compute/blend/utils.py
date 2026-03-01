@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.cache_engine import LMCacheEngine
     from lmcache.v1.gpu_connector import GPUConnectorInterface
+    from lmcache.v1.compute.indexcache.config import IndexCacheConfig
 
 logger = init_logger(__name__)
 
@@ -70,4 +71,37 @@ class LMCBlenderBuilder:
         """
         if instance_id not in cls._blenders:
             raise ValueError(f"Blender for {instance_id} not found.")
+        return cls._blenders[instance_id]
+
+
+class IndexCacheBlenderBuilder:
+    """Builder for IndexCacheBlender — parallel to LMCBlenderBuilder."""
+
+    _blenders: Dict[str, "IndexCacheBlender"] = {}
+
+    @classmethod
+    def get_or_create(
+        cls,
+        instance_id: str,
+        config: "IndexCacheConfig",
+    ):
+        if instance_id not in cls._blenders:
+            from lmcache.v1.compute.indexcache.blender import IndexCacheBlender
+
+            logger.info(f"Creating IndexCacheBlender for {instance_id}")
+            vllm_model = VLLMModelTracker.get_model(instance_id)
+            cls._blenders[instance_id] = IndexCacheBlender(vllm_model, config)
+        else:
+            logger.info(
+                f"IndexCacheBlender for {instance_id} already exists, "
+                "returning the original one."
+            )
+        return cls._blenders[instance_id]
+
+    @classmethod
+    def get(cls, instance_id: str):
+        if instance_id not in cls._blenders:
+            raise ValueError(
+                f"IndexCacheBlender for {instance_id} not found."
+            )
         return cls._blenders[instance_id]
