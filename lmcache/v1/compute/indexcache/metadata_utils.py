@@ -50,13 +50,17 @@ def find_important_pages_fast(
         torch.ones((1, 1, K, K), device=attn_scores.device, dtype=torch.bool)
     )
 
-    causal_scores = attn_scores.masked_fill(~causal_mask, 0.0)
-    important_mask = causal_scores >= imp_threshold
+    # Combine threshold + causal in one mask (avoids masked_fill copy of attn_scores)
+    important_mask = (attn_scores >= imp_threshold) & causal_mask
+    del causal_mask
 
-    # Per-key (column) importance counts
-    num_imp = important_mask.sum(dim=-2)                 # (B, H, K)
-    total_causal = causal_mask.sum(dim=-2)               # (1, 1, K)
-    consistency = num_imp.float() / total_causal.float()
+    # Per-key (column) importance counts (int16 saves 8x vs default int64)
+    num_imp = important_mask.sum(dim=-2, dtype=torch.int16)  # (B, H, K)
+    del important_mask
+
+    # Column j in lower-triangular has j+1 non-zero entries — compute analytically
+    total_causal = torch.arange(1, K + 1, device=attn_scores.device, dtype=torch.float)
+    consistency = num_imp.float() / total_causal
 
     # Strong tokens per key
     strong_tokens = consistency >= strong_consistency     # (B, H, K)
