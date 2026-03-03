@@ -8,6 +8,7 @@ from typing import List, Tuple
 @dataclass
 class IndexCacheConfig:
     page_size: int = 64
+    attn_backend: str = "lean_attn"  # "lean_attn" or "fa3"
     threshold: float = 0.001       # LA hot-tile threshold
     ca_threshold: float = 0.01     # CA important-page threshold
     ca_consistency: float = 0.1    # CA strong-consistency threshold
@@ -19,6 +20,7 @@ class IndexCacheConfig:
     def from_env(cls) -> "IndexCacheConfig":
         return cls(
             page_size=int(os.getenv("LMCACHE_INDEXCACHE_PAGE_SIZE", "64")),
+            attn_backend=os.getenv("LMCACHE_INDEXCACHE_ATTN_BACKEND", "lean_attn"),
             threshold=float(os.getenv("LMCACHE_INDEXCACHE_THRESHOLD", "0.001")),
             ca_threshold=float(os.getenv("LMCACHE_INDEXCACHE_CA_THRESHOLD", "0.01")),
             ca_consistency=float(os.getenv("LMCACHE_INDEXCACHE_CA_CONSISTENCY", "0.1")),

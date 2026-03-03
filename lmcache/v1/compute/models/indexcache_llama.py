@@ -19,8 +19,10 @@ from lmcache.v1.compute.indexcache.metadata_utils import (
 
 logger = init_logger(__name__)
 
-# Lazy import — only needed at prefill time
+# Lazy imports — only needed at prefill time
 _lean_attn_prime_cache_func = None
+_flash_attn_forward_func = None
+_build_indexcache_metadata_func = None
 
 
 def _get_lean_attn():
@@ -29,6 +31,20 @@ def _get_lean_attn():
         from lean_attn import lean_attn_prime_cache_func
         _lean_attn_prime_cache_func = lean_attn_prime_cache_func
     return _lean_attn_prime_cache_func
+
+
+def _get_fa3():
+    global _flash_attn_forward_func, _build_indexcache_metadata_func
+    if _flash_attn_forward_func is None:
+        import sys
+        fa3_path = "/var/tmp/rsanovar3/flash-attention/hopper"
+        if fa3_path not in sys.path:
+            sys.path.insert(0, fa3_path)
+        from flash_attn_interface import _flash_attn_forward
+        from sparse_indexcache_utils import build_indexcache_metadata
+        _flash_attn_forward_func = _flash_attn_forward
+        _build_indexcache_metadata_func = build_indexcache_metadata
+    return _flash_attn_forward_func, _build_indexcache_metadata_func
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -182,29 +198,33 @@ class LMCIndexCacheLlamaModel(nn.Module):
         page_size: int,
         kvcaches: list,
         slot_mapping: torch.Tensor,
+        attn_backend: str = "lean_attn",
+        question_len: int = 0,
+        sparse_metadata_caches: list = None,
     ):
-        """Generator — runs lean_attn prefill and writes KV to paged buffer.
+        """Generator — runs sparse attention prefill and writes KV to paged buffer.
 
-        For each layer:
-        1. layernorm → qkv_proj → RoPE
-        2. repeat_kv (expand KV heads for lean_attn)
-        3. lean_attn_prime_cache_func(Q, K, V, kvcolidx, hot_tile, offsets, page_size)
-        4. Write unexpanded K, V to vLLM paged buffer
-        5. o_proj → post_layernorm → MLP
-        6. yield
+        Supports two backends:
+        - "lean_attn": original lean_attn (expanded KV, [B,H,S,D] layout)
+        - "fa3": sparse FA3 Hopper kernel (GQA native, [B,S,H,D] layout)
 
         Args:
-            input_ids: 1-D token IDs for context tokens (num_tokens,)
+            input_ids: 1-D token IDs (context + question tokens)
             kvcolidx_caches: per-layer kvcolidx tensors (merged across chunks)
             la_hot_tile_caches: per-layer LA_hot_tile_code tensors (merged)
-            offset_list: chunk boundary offsets for lean_attn
-            page_size: page size for lean_attn
+            offset_list: chunk boundary offsets
+            page_size: page size for attention
             kvcaches: list of (K_paged, V_paged) per layer from vLLM
             slot_mapping: maps token positions to paged buffer slots
+            attn_backend: "lean_attn" or "fa3"
+            question_len: number of question tokens (needed for FA3 metadata)
+            sparse_metadata_caches: pre-built FA3 sparse metadata per layer
+                (list of (sparse_n_indices, sparse_n_offsets, sparse_n_mask_counts)
+                 tuples). If provided, skips build_indexcache_metadata() in the
+                 per-layer loop.
         """
         import lmcache.c_ops as lmc_ops
 
-        lean_attn_fn = _get_lean_attn()
         seq_len = input_ids.shape[0]
 
         hidden_states = self.vllm_model.get_input_embeddings(input_ids.cuda())
@@ -232,42 +252,83 @@ class LMCIndexCacheLlamaModel(nn.Module):
             # --- RoPE ---
             q, k = layer.self_attn.rotary_emb(positions, q, k)
 
-            # --- Reshape for lean_attn ---
-            # lean_attn expects (bsz, num_heads, seq_len, head_dim)
-            q_4d = q.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-            k_4d = k.view(1, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            v_4d = v.view(1, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            # --- Sparse attention (backend-dependent) ---
+            if attn_backend == "fa3":
+                # FA3 expects Q: [B, seqlen, H, D], K/V: [B, seqlen, H_kv, D]
+                # No KV expansion needed — FA3 handles GQA natively
+                fa3_fwd, _ = _get_fa3()
 
-            # Expand KV heads for lean_attn
-            k_expanded = repeat_kv(k_4d, self.num_kv_groups)
-            v_expanded = repeat_kv(v_4d, self.num_kv_groups)
+                q_fa3 = q.view(1, seq_len, self.num_heads, self.head_dim).contiguous()
+                k_fa3 = k.view(1, seq_len, self.num_kv_heads, self.head_dim).contiguous()
+                v_fa3 = v.view(1, seq_len, self.num_kv_heads, self.head_dim).contiguous()
 
-            # --- Sparse attention via lean_attn ---
-            kvcolidx = kvcolidx_caches[layer_idx].contiguous()
-            la_hot_tile = la_hot_tile_caches[layer_idx].contiguous()
-            q_cont = q_4d.contiguous()
-            k_cont = k_expanded.contiguous()
-            v_cont = v_expanded.contiguous()
+                # Use pre-built sparse metadata (converted in blend() before prefill)
+                if sparse_metadata_caches is not None:
+                    sparse_n_indices, sparse_n_offsets, sparse_n_mask_counts = \
+                        sparse_metadata_caches[layer_idx]
+                else:
+                    # Fallback: build on the fly (slow — ~850ms per layer)
+                    _, build_meta = _get_fa3()
+                    kvcolidx = kvcolidx_caches[layer_idx].contiguous()
+                    la_hot_tile = la_hot_tile_caches[layer_idx].contiguous()
+                    sparse_n_indices, sparse_n_offsets, sparse_n_mask_counts = build_meta(
+                        seqlen_total=seq_len,
+                        offset_list=offset_list,
+                        question_len=question_len,
+                        kvcolidx_cache=kvcolidx,
+                        la_hot_tile_code_cache=la_hot_tile,
+                        num_heads_kv=self.num_kv_heads,
+                        kBlockM=128,
+                        kBlockN=128,
+                        page_size=page_size,
+                        device=str(q.device),
+                    )
 
-            attn_output = lean_attn_fn(
-                q_cont,
-                k_cont,
-                v_cont,
-                kvcolidx_cache=kvcolidx,
-                LA_hot_tile_code_cache=la_hot_tile,
-                offset_list=offset_list,
-                page_size=page_size,
-                causal=True,
-            )
-            # (1, num_heads, seq_len, head_dim) → (seq_len, num_heads * head_dim)
-            attn_output = (
-                attn_output.transpose(1, 2).contiguous().view(seq_len, -1)
-            )
+                softmax_scale = self.head_dim ** (-0.5)
+                out, _, _, _ = fa3_fwd(
+                    q_fa3, k_fa3, v_fa3,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    sparse_n_indices=sparse_n_indices,
+                    sparse_n_offsets=sparse_n_offsets,
+                    sparse_n_mask_counts=sparse_n_mask_counts,
+                )
+                # out: [1, seqlen, H, D] → [seqlen, H * D]
+                attn_output = out.view(seq_len, -1)
+
+            else:
+                # lean_attn expects (bsz, num_heads, seq_len, head_dim)
+                lean_attn_fn = _get_lean_attn()
+
+                q_4d = q.view(1, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+                k_4d = k.view(1, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                v_4d = v.view(1, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+                k_expanded = repeat_kv(k_4d, self.num_kv_groups)
+                v_expanded = repeat_kv(v_4d, self.num_kv_groups)
+
+                kvcolidx = kvcolidx_caches[layer_idx].contiguous()
+                la_hot_tile = la_hot_tile_caches[layer_idx].contiguous()
+
+                attn_output = lean_attn_fn(
+                    q_4d.contiguous(),
+                    k_expanded.contiguous(),
+                    v_expanded.contiguous(),
+                    kvcolidx_cache=kvcolidx,
+                    LA_hot_tile_code_cache=la_hot_tile,
+                    offset_list=offset_list,
+                    page_size=page_size,
+                    causal=True,
+                )
+                # (1, num_heads, seq_len, head_dim) → (seq_len, num_heads * head_dim)
+                attn_output = (
+                    attn_output.transpose(1, 2).contiguous().view(seq_len, -1)
+                )
 
             # --- Write KV to vLLM paged buffer ---
             # Use UNEXPANDED K, V (num_kv_heads) for the paged cache
             k_for_cache = k.contiguous()   # (seq_len, kv_size)
-            v_for_cache = v.contiguous()   # (seq_len, kv_size) — v is pre-RoPE, that's correct
+            v_for_cache = v.contiguous()   # (seq_len, kv_size)
 
             kv_buf = torch.stack(
                 [k_for_cache, v_for_cache], dim=0

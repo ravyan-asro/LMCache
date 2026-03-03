@@ -4,11 +4,16 @@ Cache gen:  runs dense attention on each chunk using vLLM weights,
             stores metadata (kvcolidx + LA_hot_tile_code) per layer.
             No KV is stored anywhere.
 
-Prefill:    runs lean_attn on context tokens with merged metadata,
+Prefill:    runs lean_attn/FA3 on context tokens with merged metadata,
             writes resulting KV to vLLM paged buffer for decode.
+
+For FA3 backend, sparse metadata (sparse_n_indices, sparse_n_offsets,
+sparse_n_mask_counts) is pre-computed BEFORE the prefill forward pass
+so the conversion cost is not included in TTFT.
 """
 
 import itertools
+import time
 
 import torch
 
@@ -87,6 +92,96 @@ class IndexCacheBlender:
         return 0
 
     # ------------------------------------------------------------------
+    # FA3 metadata pre-computation (called BEFORE llm.generate())
+    # ------------------------------------------------------------------
+    def precompute_sparse_metadata(
+        self, total_seqlen: int, question_len: int, device: str = "cuda"
+    ):
+        """Pre-compute FA3 sparse metadata for all layers.
+
+        Call this after all cache_gen() calls and before llm.generate()
+        so the conversion cost is excluded from TTFT.
+
+        Args:
+            total_seqlen: total number of tokens (context + question)
+            question_len: number of question tokens
+            device: target device for sparse tensors
+        """
+        if self.config.attn_backend != "fa3":
+            return
+
+        if not self.chunk_metadata:
+            logger.warning("precompute_sparse_metadata: no chunk metadata")
+            return
+
+        from lmcache.v1.compute.models.indexcache_llama import _get_fa3
+        _, build_meta = _get_fa3()
+
+        # Merge metadata (same logic as blend())
+        page_size = self.config.page_size
+        offset_list = list(
+            itertools.accumulate(cl for cl, _, _ in self.chunk_metadata)
+        )
+        chunk_num_pages = [cl // page_size for cl, _, _ in self.chunk_metadata]
+        pages_before = [0]
+        for np in chunk_num_pages[:-1]:
+            pages_before.append(pages_before[-1] + np)
+
+        num_chunks = len(self.chunk_metadata)
+
+        t0 = time.time()
+        self._precomputed_sparse_metadata = []
+
+        for layer_idx in range(self.model.num_layers):
+            # Merge kvcolidx (exclude last chunk)
+            kvcolidx_list = []
+            for chunk_idx in range(num_chunks - 1):
+                meta = self.chunk_metadata[chunk_idx]
+                kv = meta[1][layer_idx].to(device)
+                offset = pages_before[chunk_idx]
+                if offset > 0:
+                    kv = torch.where(kv >= 0, kv + offset, kv)
+                kvcolidx_list.append(kv)
+            if kvcolidx_list:
+                merged_kv = torch.cat(kvcolidx_list, dim=-1)
+            else:
+                B = self.chunk_metadata[0][1][layer_idx].shape[0]
+                H = self.chunk_metadata[0][1][layer_idx].shape[1]
+                merged_kv = torch.empty(
+                    B, H, 0, dtype=torch.long, device=device
+                )
+
+            # Merge hot_tile (all chunks)
+            hot_tile_list = [
+                meta[2][layer_idx].to(device)
+                for meta in self.chunk_metadata
+            ]
+            merged_ht = torch.cat(hot_tile_list, dim=-1)
+
+            # Convert to FA3 sparse format
+            indices, offsets, mask_counts = build_meta(
+                seqlen_total=total_seqlen,
+                offset_list=offset_list,
+                question_len=question_len,
+                kvcolidx_cache=merged_kv.contiguous(),
+                la_hot_tile_code_cache=merged_ht.contiguous(),
+                num_heads_kv=self.model.num_kv_heads,
+                kBlockM=128,
+                kBlockN=128,
+                page_size=page_size,
+                device=device,
+            )
+            self._precomputed_sparse_metadata.append(
+                (indices, offsets, mask_counts)
+            )
+
+        t1 = time.time()
+        logger.info(
+            f"FA3 sparse metadata pre-computed for {self.model.num_layers} "
+            f"layers in {t1 - t0:.3f}s (excluded from TTFT)"
+        )
+
+    # ------------------------------------------------------------------
     # Prefill (called from start_load_kv)
     # ------------------------------------------------------------------
     def blend(self, tokens: torch.Tensor, mask=None, **kwargs):
@@ -157,10 +252,57 @@ class IndexCacheBlender:
             ]
             hot_tile_caches.append(torch.cat(hot_tile_list, dim=-1))
 
+        # Compute question_len: total tokens minus context tokens
+        # tokens = full prompt (context + question), offset_list[-1] = context length
+        question_len = len(tokens) - offset_list[-1]
+
         logger.info(
-            f"IndexCache blend: {len(tokens)} context tokens, "
-            f"{len(self.chunk_metadata)} chunks, offsets={offset_list}"
+            f"IndexCache blend: {len(tokens)} total tokens "
+            f"({len(tokens) - question_len} context + {question_len} question), "
+            f"{len(self.chunk_metadata)} chunks, offsets={offset_list}, "
+            f"backend={self.config.attn_backend}"
         )
+
+        # --- Use pre-computed FA3 sparse metadata if available ---
+        sparse_metadata_caches = getattr(
+            self, '_precomputed_sparse_metadata', None
+        )
+        if self.config.attn_backend == "fa3" and sparse_metadata_caches is None:
+            # Fallback: compute in-band (will be part of TTFT)
+            logger.warning(
+                "FA3 sparse metadata not pre-computed — "
+                "call precompute_sparse_metadata() before generate() "
+                "to exclude conversion from TTFT"
+            )
+            from lmcache.v1.compute.models.indexcache_llama import _get_fa3
+            _, build_meta = _get_fa3()
+
+            t0 = time.time()
+            sparse_metadata_caches = []
+            for layer_idx in range(self.model.num_layers):
+                kvcolidx = kvcolidx_caches[layer_idx].contiguous()
+                la_hot_tile = hot_tile_caches[layer_idx].contiguous()
+
+                indices, offsets, mask_counts = build_meta(
+                    seqlen_total=len(tokens),
+                    offset_list=offset_list,
+                    question_len=question_len,
+                    kvcolidx_cache=kvcolidx,
+                    la_hot_tile_code_cache=la_hot_tile,
+                    num_heads_kv=self.model.num_kv_heads,
+                    kBlockM=128,
+                    kBlockN=128,
+                    page_size=self.config.page_size,
+                    device=str(device),
+                )
+                sparse_metadata_caches.append(
+                    (indices, offsets, mask_counts)
+                )
+            t1 = time.time()
+            logger.info(
+                f"IndexCache FA3 metadata computed in-band: "
+                f"{t1 - t0:.3f}s (included in TTFT)"
+            )
 
         with torch.no_grad():
             gen = self.model.compute_layer(
@@ -171,6 +313,9 @@ class IndexCacheBlender:
                 self.config.page_size,
                 kvcaches,
                 slot_mapping,
+                attn_backend=self.config.attn_backend,
+                question_len=question_len,
+                sparse_metadata_caches=sparse_metadata_caches,
             )
             for _ in range(self.model.num_layers):
                 next(gen)
@@ -184,4 +329,5 @@ class IndexCacheBlender:
         """Clear stored metadata for the next query."""
         self.chunk_metadata.clear()
         self.cached_token_ids.clear()
+        self._precomputed_sparse_metadata = None
         logger.info("IndexCache metadata reset")
