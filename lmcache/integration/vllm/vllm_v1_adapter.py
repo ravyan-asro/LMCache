@@ -36,7 +36,11 @@ from lmcache.integration.vllm.utils import (
 from lmcache.integration.vllm.vllm_adapter import init_lmcache_engine
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
-from lmcache.v1.compute.blend import IndexCacheBlenderBuilder, LMCBlenderBuilder
+from lmcache.v1.compute.blend import (
+    IndexCacheBlenderBuilder,
+    IndexCacheSchedulerTracker,
+    LMCBlenderBuilder,
+)
 from lmcache.v1.lookup_client import LookupClientFactory
 
 if TYPE_CHECKING:
@@ -463,11 +467,28 @@ class LMCacheConnectorV1Impl:
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
 
-            # IndexCache: lean_attn prefill → write KV to paged buffer
+            # IndexCache: sparse attention prefill → write KV to paged buffer
             if (
                 getattr(self, "enable_indexcache", False)
                 and self.indexcache_blender is not None
             ):
+                # Pre-compute FA3 sparse metadata if not already done
+                # (for TP>1, the test script can't call precompute directly)
+                ic = self.indexcache_blender
+                if (
+                    ic.config.attn_backend == "fa3"
+                    and ic.chunk_metadata
+                    and getattr(ic, '_precomputed_sparse_metadata', None) is None
+                ):
+                    context_len = sum(
+                        cl for cl, _, _ in ic.chunk_metadata
+                    )
+                    question_len = lmcache_cached_tokens - context_len
+                    ic.precompute_sparse_metadata(
+                        total_seqlen=lmcache_cached_tokens,
+                        question_len=question_len,
+                        device="cuda",
+                    )
                 self.indexcache_blender.blend(
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
@@ -566,6 +587,14 @@ class LMCacheConnectorV1Impl:
             **kwargs: additional arguments for the save operation.
         """
 
+        # IndexCache: skip per-layer KV store — cache_gen runs in
+        # wait_for_save instead (processes all layers at once).
+        if getattr(self, "enable_indexcache", False):
+            if self.current_layer == 0:
+                self.layerwise_storers = []
+            self.current_layer += 1
+            return
+
         if not self.use_layerwise:
             return
 
@@ -648,6 +677,29 @@ class LMCacheConnectorV1Impl:
         """Blocking until the KV cache is saved to the connector buffer."""
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
+            return
+
+        # IndexCache: run cache_gen for chunk requests (TP>1 path).
+        # Cache-gen chunks have load_spec=None; the real query has
+        # load_spec set (blend already handled in start_load_kv).
+        if getattr(self, "enable_indexcache", False):
+            if self.indexcache_blender is not None:
+                connector_metadata = self._parent._get_connector_metadata()
+                assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+                for request in connector_metadata.requests:
+                    if request.load_spec is not None:
+                        continue  # real query — skip
+                    save_spec = request.save_spec
+                    if save_spec is None or not save_spec.can_save:
+                        continue
+                    token_ids = request.token_ids
+                    logger.info(
+                        "IndexCache cache_gen via save path: %d tokens "
+                        "for request %s",
+                        len(token_ids),
+                        request.req_id,
+                    )
+                    self.indexcache_blender.cache_gen(token_ids.cuda())
             return
 
         if self.use_layerwise:
@@ -759,20 +811,56 @@ class LMCacheConnectorV1Impl:
                 token_ids, request.mm_hashes, request.mm_positions
             )
 
-        # IndexCache: check metadata store instead of LMCache storage
-        # (lazy lookup — blender created by worker-side, shared in-process)
+        # IndexCache: check metadata store instead of LMCache storage.
+        # TP=1: blender is in-process (shared via VLLM_ENABLE_V1_MULTIPROCESSING=0).
+        # TP>1: blender lives in worker processes; fall back to the
+        #        scheduler-side IndexCacheSchedulerTracker that auto-
+        #        populates from cache-gen requests (no IPC needed).
         if getattr(self, "enable_indexcache", False):
             if self._indexcache_blender_ref is None:
+                # Try direct blender access (TP=1, same process)
                 try:
                     self._indexcache_blender_ref = (
                         IndexCacheBlenderBuilder.get(ENGINE_NAME)
                     )
                 except ValueError:
                     pass
+                # Fall back to scheduler-side tracker (TP>1).
+                # Create it here so it lives in the EngineCore process.
+                if self._indexcache_blender_ref is None:
+                    self._indexcache_blender_ref = (
+                        IndexCacheSchedulerTracker.get(ENGINE_NAME)
+                    )
+                    if self._indexcache_blender_ref is None:
+                        self._indexcache_blender_ref = (
+                            IndexCacheSchedulerTracker.get_or_create(
+                                ENGINE_NAME
+                            )
+                        )
             if self._indexcache_blender_ref is not None:
                 num_external_hit_tokens = (
                     self._indexcache_blender_ref.lookup(token_ids)
                 )
+                # Auto-populate tracker: when lookup returns 0, this is
+                # a cache-gen chunk. Record its tokens so subsequent
+                # requests with a matching prefix get a hit.
+                # This is needed for TP>1 where the test script and the
+                # scheduler (EngineCore) are in different processes.
+                if (
+                    num_external_hit_tokens == 0
+                    and isinstance(
+                        self._indexcache_blender_ref,
+                        IndexCacheSchedulerTracker,
+                    )
+                ):
+                    if hasattr(token_ids, "tolist"):
+                        self._indexcache_blender_ref.add_chunk(
+                            token_ids.tolist()
+                        )
+                    else:
+                        self._indexcache_blender_ref.add_chunk(
+                            list(token_ids)
+                        )
             else:
                 num_external_hit_tokens = 0
         elif self.skip_last_n_tokens > 0:

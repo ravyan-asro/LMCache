@@ -81,6 +81,10 @@ class LMCIndexCacheLlamaModel(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
+        # Detect QK-norm (e.g. Qwen3 MoE) — must be applied between
+        # QKV split and RoPE.
+        self.has_qk_norm = hasattr(attn0, "q_norm") and hasattr(attn0, "k_norm")
+
     # ------------------------------------------------------------------
     # Cache Gen: dense attention for metadata extraction
     # ------------------------------------------------------------------
@@ -120,6 +124,15 @@ class LMCIndexCacheLlamaModel(nn.Module):
             q, k, v = qkv.split(
                 [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
+
+            # --- QK-norm (Qwen3 MoE and similar models) ---
+            if self.has_qk_norm:
+                q = layer.self_attn.q_norm(
+                    q.view(*q.shape[:-1], self.num_heads, self.head_dim)
+                ).view(q.shape)
+                k = layer.self_attn.k_norm(
+                    k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
+                ).view(k.shape)
 
             # --- RoPE ---
             q, k = layer.self_attn.rotary_emb(positions, q, k)
@@ -248,6 +261,15 @@ class LMCIndexCacheLlamaModel(nn.Module):
             q, k, v = qkv.split(
                 [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
+
+            # --- QK-norm (Qwen3 MoE and similar models) ---
+            if self.has_qk_norm:
+                q = layer.self_attn.q_norm(
+                    q.view(*q.shape[:-1], self.num_heads, self.head_dim)
+                ).view(q.shape)
+                k = layer.self_attn.k_norm(
+                    k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
+                ).view(k.shape)
 
             # --- RoPE ---
             q, k = layer.self_attn.rotary_emb(positions, q, k)

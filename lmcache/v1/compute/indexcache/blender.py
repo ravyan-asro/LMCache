@@ -13,6 +13,9 @@ so the conversion cost is not included in TTFT.
 """
 
 import itertools
+import json
+import math
+import os
 import time
 
 import torch
@@ -179,6 +182,132 @@ class IndexCacheBlender:
         logger.info(
             f"FA3 sparse metadata pre-computed for {self.model.num_layers} "
             f"layers in {t1 - t0:.3f}s (excluded from TTFT)"
+        )
+
+        # Compute and save sparsity + size stats (rank 0 only for TP>1)
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        if rank == 0:
+            self._compute_and_save_stats(total_seqlen, question_len)
+
+    def _compute_and_save_stats(self, total_seqlen: int, question_len: int):
+        """Compute sparsity and IndexCache size stats, save to temp file.
+
+        This allows the test script to read stats for TP>1 where the
+        main process cannot access worker metadata directly.
+        """
+        page_size = self.config.page_size
+        num_layers = self.model.num_layers
+
+        # --- Block sparsity from FA3 sparse metadata ---
+        total_sparse_blocks = 0
+        for indices, offsets, mask_counts in self._precomputed_sparse_metadata:
+            total_sparse_blocks += indices.numel()
+
+        num_heads_q = self.model.num_heads
+        num_m_blocks = math.ceil(total_seqlen / 128)  # kBlockM=128
+        num_n_blocks = math.ceil(total_seqlen / 128)  # kBlockN=128
+
+        # Dense baseline: sum of causal n_block_max for each m_block, times heads, times layers
+        dense_per_m = 0
+        for m in range(num_m_blocks):
+            n_max = min(
+                math.ceil(((m + 1) * 128 + total_seqlen - total_seqlen) / 128),
+                num_n_blocks,
+            )  # since seqlen_q == seqlen_k, simplifies to min(m+1, num_n_blocks)
+            dense_per_m += n_max
+        total_dense_blocks = dense_per_m * num_heads_q * num_layers
+
+        block_sparsity = 1.0 - (total_sparse_blocks / total_dense_blocks) if total_dense_blocks > 0 else 0.0
+
+        # --- CA / LA sparsity from chunk_metadata (same as test script) ---
+        bitmask = torch.tensor([1 << i for i in reversed(range(8))], dtype=torch.uint8)
+        chunk_num_pages = [cl // page_size for cl, _, _ in self.chunk_metadata]
+        doc_page_offsets = [0]
+        for np_ in chunk_num_pages:
+            doc_page_offsets.append(doc_page_offsets[-1] + np_)
+        total_doc_pages = doc_page_offsets[-1]
+        num_docs = len(self.chunk_metadata)
+        H = self.chunk_metadata[0][1][0].shape[1]  # num Q heads
+
+        total_tiles = (total_doc_pages * (total_doc_pages + 1) // 2) * H * num_layers
+        total_LA_tiles = 0
+        for i in range(num_docs):
+            dp = doc_page_offsets[i + 1] - doc_page_offsets[i]
+            total_LA_tiles += (dp * (dp + 1) // 2) * H * num_layers
+        total_CA_tiles = total_tiles - total_LA_tiles
+
+        pages_before = [0]
+        for np_ in chunk_num_pages[:-1]:
+            pages_before.append(pages_before[-1] + np_)
+
+        # Precompute doc_end_page lookup: for page p in doc d, end = doc_page_offsets[d+1]
+        page_to_doc_end = []
+        for d in range(num_docs):
+            dp = doc_page_offsets[d + 1] - doc_page_offsets[d]
+            page_to_doc_end.extend([doc_page_offsets[d + 1]] * dp)
+
+        active_CA_tiles = 0
+        active_LA_tiles = 0
+        for layer_idx in range(num_layers):
+            if layer_idx < 4:
+                active_CA_tiles += total_CA_tiles / num_layers
+                active_LA_tiles += total_LA_tiles / num_layers
+                continue
+
+            # CA: vectorized count from kvcolidx
+            for chunk_idx in range(num_docs - 1):
+                kv = self.chunk_metadata[chunk_idx][1][layer_idx][0]  # (H, num_kvcols)
+                offset = pages_before[chunk_idx]
+                for h_idx in range(H):
+                    kv_h = kv[h_idx]
+                    if offset > 0:
+                        kv_h = torch.where(kv_h >= 0, kv_h + offset, kv_h)
+                    kv_valid = kv_h[kv_h >= 0].tolist()
+                    for val in kv_valid:
+                        val = int(val)
+                        if 0 <= val < len(page_to_doc_end):
+                            active_CA_tiles += total_doc_pages - page_to_doc_end[val]
+
+            # LA: count hot bits (vectorized)
+            hot_tile_list = [meta[2][layer_idx] for meta in self.chunk_metadata]
+            layer_code = torch.cat(hot_tile_list, dim=-1)[0]  # (H, total_bytes)
+            active_bits = torch.bitwise_and(layer_code.unsqueeze(-1), bitmask) > 0
+            active_LA_tiles += active_bits.sum().item()
+
+        sparsity_total = 1.0 - (active_CA_tiles + active_LA_tiles) / total_tiles if total_tiles > 0 else 0.0
+        sparsity_ca = 1.0 - active_CA_tiles / total_CA_tiles if total_CA_tiles > 0 else 0.0
+        sparsity_la = 1.0 - active_LA_tiles / total_LA_tiles if total_LA_tiles > 0 else 0.0
+
+        # --- IndexCache metadata size ---
+        ca_bytes = 0
+        la_bytes = 0
+        for chunk_len, layer_kvcolidx, layer_hot_tile in self.chunk_metadata:
+            for li in range(num_layers):
+                kv = layer_kvcolidx[li]
+                ht = layer_hot_tile[li]
+                ca_bytes += kv.numel() * kv.element_size()
+                la_bytes += ht.numel() * ht.element_size()
+
+        stats = {
+            "sparsity_total": sparsity_total,
+            "sparsity_ca": sparsity_ca,
+            "sparsity_la": sparsity_la,
+            "block_sparsity": block_sparsity,
+            "total_sparse_blocks": total_sparse_blocks,
+            "total_dense_blocks": total_dense_blocks,
+            "indexcache_ca_size_gb": ca_bytes / (1024 ** 3),
+            "indexcache_la_size_gb": la_bytes / (1024 ** 3),
+            "indexcache_total_size_gb": (ca_bytes + la_bytes) / (1024 ** 3),
+        }
+
+        stats_path = "/tmp/indexcache_stats.json"
+        with open(stats_path, "w") as f:
+            json.dump(stats, f)
+        logger.info(
+            f"IndexCache stats saved to {stats_path}: "
+            f"sparsity={sparsity_total:.2%} (CA:{sparsity_ca:.2%}, LA:{sparsity_la:.2%}), "
+            f"block_sparsity={block_sparsity:.2%}, "
+            f"size={stats['indexcache_total_size_gb']:.6f} GB"
         )
 
     # ------------------------------------------------------------------

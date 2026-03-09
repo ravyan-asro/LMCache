@@ -105,3 +105,57 @@ class IndexCacheBlenderBuilder:
                 f"IndexCacheBlender for {instance_id} not found."
             )
         return cls._blenders[instance_id]
+
+
+class IndexCacheSchedulerTracker:
+    """Lightweight scheduler-side token tracker for IndexCache with TP>1.
+
+    When TP>1, the IndexCacheBlender lives in worker processes (not the
+    scheduler process).  This tracker sits in the scheduler process and
+    records which tokens have been cache-gen'd so that
+    get_num_new_matched_tokens() can claim the full prompt.
+
+    Populated by the test script (which shares a process with the scheduler
+    when using vLLM's LLM API).
+    """
+
+    _instances: Dict[str, "IndexCacheSchedulerTracker"] = {}
+
+    def __init__(self):
+        self.cached_token_ids: list = []
+
+    def add_chunk(self, chunk_token_ids: list):
+        """Record a chunk's token IDs after cache_gen completes."""
+        self.cached_token_ids.extend(chunk_token_ids)
+
+    def lookup(self, token_ids) -> int:
+        """Same semantics as IndexCacheBlender.lookup().
+
+        If the cached prefix matches, claim the FULL prompt so that
+        blend() handles context + question in one sparse-attention pass.
+        """
+        if not self.cached_token_ids:
+            return 0
+        n = min(len(token_ids), len(self.cached_token_ids))
+        if n == 0:
+            return 0
+        if hasattr(token_ids, "tolist"):
+            query_prefix = token_ids[:n].tolist()
+        else:
+            query_prefix = list(token_ids[:n])
+        if query_prefix == self.cached_token_ids[:n]:
+            return len(token_ids)
+        return 0
+
+    def reset(self):
+        self.cached_token_ids.clear()
+
+    @classmethod
+    def get_or_create(cls, instance_id: str) -> "IndexCacheSchedulerTracker":
+        if instance_id not in cls._instances:
+            cls._instances[instance_id] = cls()
+        return cls._instances[instance_id]
+
+    @classmethod
+    def get(cls, instance_id: str):
+        return cls._instances.get(instance_id)
