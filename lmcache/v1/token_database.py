@@ -192,10 +192,11 @@ class SegmentTokenDatabase(TokenDatabase):
     def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
         self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)
 
-        # TODO (Jiayi): figure out how to decide when
-        # to use `1:` (whether there's a special starting token
-        # in the beginning)
-        self.sep_tokens = self.tokenizer.encode(config.blend_special_str)[1:]
+        # Use add_special_tokens=False to avoid stripping a real token
+        # on models without a BOS token (e.g. Qwen3).
+        self.sep_tokens = self.tokenizer.encode(
+            config.blend_special_str, add_special_tokens=False
+        )
         self.sep_tokens = torch.tensor(self.sep_tokens, device="cpu")
         self.sep_len = len(self.sep_tokens)
         self.metadata = metadata
