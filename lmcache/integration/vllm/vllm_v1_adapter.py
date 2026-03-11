@@ -325,6 +325,12 @@ class LMCacheConnectorV1Impl:
                 os.environ.get("LMCACHE_INDEXCACHE_MODE", "0") == "1"
             )
             self._indexcache_blender_ref = None
+
+            # IndexCache TP>1 state (scheduler side)
+            self._ic_signal_path = "/tmp/indexcache_signal.json"
+            self._ic_current_entry_id: Optional[str] = None
+            self._ic_chunks_processed: int = 0
+            self._ic_expected_chunks: int = 0
         else:
             self.lmcache_engine = init_lmcache_engine(
                 vllm_config.model_config,
@@ -359,6 +365,13 @@ class LMCacheConnectorV1Impl:
                     )
                 )
                 logger.info("IndexCache mode enabled")
+
+            # IndexCache TP>1 state machine (driven by signal file)
+            self._ic_signal_path = "/tmp/indexcache_signal.json"
+            self._ic_current_entry_id: Optional[str] = None
+            self._ic_chunks_processed: int = 0
+            self._ic_expected_chunks: int = 0
+            self._ic_fa3_ready: bool = False
 
             # Create lookup server using factory
             assert self.lmcache_engine is not None
@@ -672,6 +685,103 @@ class LMCacheConnectorV1Impl:
 
         self.current_layer += 1
 
+    def _ic_read_signal(self):
+        """Read the IndexCache signal file written by the test script."""
+        import json as _json
+        try:
+            with open(self._ic_signal_path, "r") as f:
+                return _json.load(f)
+        except (FileNotFoundError, _json.JSONDecodeError):
+            return None
+
+    def _ic_wait_for_save_state_machine(self):
+        """IndexCache TP>1 state machine for wait_for_save.
+
+        Driven by /tmp/indexcache_signal.json written by the test script.
+        Three phases per entry:
+          1. chunk_precomp: cache_gen on each chunk
+          2. fa3_precomp: precompute_sparse_metadata (auto after last chunk)
+          3. ready: skip (real query handled by start_load_kv)
+        """
+        signal = self._ic_read_signal()
+        if signal is None:
+            return
+
+        entry_id = signal["entry_id"]
+
+        # New entry: reset blender and state
+        if entry_id != self._ic_current_entry_id:
+            logger.info(
+                "IndexCache new entry %s (was %s), resetting blender",
+                entry_id,
+                self._ic_current_entry_id,
+            )
+            self.indexcache_blender.reset()
+            self._ic_current_entry_id = entry_id
+            self._ic_expected_chunks = signal["expected_chunks"]
+            self._ic_chunks_processed = 0
+            self._ic_fa3_ready = False
+
+        # Phase 3: all done, skip (real query)
+        if self._ic_fa3_ready:
+            logger.info(
+                "IndexCache entry %s: fa3 ready, skipping wait_for_save",
+                entry_id,
+            )
+            return
+
+        # Phase 1: cache_gen on chunk
+        if self._ic_chunks_processed < self._ic_expected_chunks:
+            connector_metadata = self._parent._get_connector_metadata()
+            assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+            for request in connector_metadata.requests:
+                save_spec = request.save_spec
+                if save_spec is None or not save_spec.can_save:
+                    continue
+                token_ids = request.token_ids
+                logger.info(
+                    "IndexCache cache_gen via save path: %d tokens "
+                    "for request %s (chunk %d/%d, entry %s)",
+                    len(token_ids),
+                    request.req_id,
+                    self._ic_chunks_processed + 1,
+                    self._ic_expected_chunks,
+                    entry_id,
+                )
+                self.indexcache_blender.cache_gen(token_ids.cuda())
+                self._ic_chunks_processed += 1
+
+            # Phase 2: auto-trigger after last chunk
+            if self._ic_chunks_processed >= self._ic_expected_chunks:
+                total_seqlen = signal["total_seqlen"]
+                question_len = signal["question_len"]
+                logger.info(
+                    "IndexCache entry %s: all %d chunks done, "
+                    "running precompute_sparse_metadata "
+                    "(seqlen=%d, question=%d)",
+                    entry_id,
+                    self._ic_expected_chunks,
+                    total_seqlen,
+                    question_len,
+                )
+                self.indexcache_blender.precompute_sparse_metadata(
+                    total_seqlen=total_seqlen,
+                    question_len=question_len,
+                    device="cuda",
+                )
+                self._ic_fa3_ready = True
+            return
+
+        # Shouldn't reach here, but be safe
+        logger.warning(
+            "IndexCache entry %s: unexpected state "
+            "(chunks=%d, expected=%d, fa3_ready=%s)",
+            entry_id,
+            self._ic_chunks_processed,
+            self._ic_expected_chunks,
+            self._ic_fa3_ready,
+        )
+
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
@@ -679,27 +789,15 @@ class LMCacheConnectorV1Impl:
             # Don't do save if the role is kv_consumer
             return
 
-        # IndexCache: run cache_gen for chunk requests (TP>1 path).
-        # Cache-gen chunks have load_spec=None; the real query has
-        # load_spec set (blend already handled in start_load_kv).
+        # IndexCache TP>1 state machine (driven by signal file).
+        # States:  chunk_precomp → fa3_precomp (auto) → ready (skip)
+        #
+        # The test script writes /tmp/indexcache_signal.json with
+        # {entry_id, expected_chunks, total_seqlen, question_len}
+        # before each entry's cache-gen phase.
         if getattr(self, "enable_indexcache", False):
             if self.indexcache_blender is not None:
-                connector_metadata = self._parent._get_connector_metadata()
-                assert isinstance(connector_metadata, LMCacheConnectorMetadata)
-                for request in connector_metadata.requests:
-                    if request.load_spec is not None:
-                        continue  # real query — skip
-                    save_spec = request.save_spec
-                    if save_spec is None or not save_spec.can_save:
-                        continue
-                    token_ids = request.token_ids
-                    logger.info(
-                        "IndexCache cache_gen via save path: %d tokens "
-                        "for request %s",
-                        len(token_ids),
-                        request.req_id,
-                    )
-                    self.indexcache_blender.cache_gen(token_ids.cuda())
+                self._ic_wait_for_save_state_machine()
             return
 
         if self.use_layerwise:
@@ -813,9 +911,8 @@ class LMCacheConnectorV1Impl:
 
         # IndexCache: check metadata store instead of LMCache storage.
         # TP=1: blender is in-process (shared via VLLM_ENABLE_V1_MULTIPROCESSING=0).
-        # TP>1: blender lives in worker processes; fall back to the
-        #        scheduler-side IndexCacheSchedulerTracker that auto-
-        #        populates from cache-gen requests (no IPC needed).
+        # TP>1: blender lives in worker processes; use signal file +
+        #        IndexCacheSchedulerTracker to determine hits.
         if getattr(self, "enable_indexcache", False):
             if self._indexcache_blender_ref is None:
                 # Try direct blender access (TP=1, same process)
@@ -826,41 +923,60 @@ class LMCacheConnectorV1Impl:
                 except ValueError:
                     pass
                 # Fall back to scheduler-side tracker (TP>1).
-                # Create it here so it lives in the EngineCore process.
                 if self._indexcache_blender_ref is None:
                     self._indexcache_blender_ref = (
-                        IndexCacheSchedulerTracker.get(ENGINE_NAME)
-                    )
-                    if self._indexcache_blender_ref is None:
-                        self._indexcache_blender_ref = (
-                            IndexCacheSchedulerTracker.get_or_create(
-                                ENGINE_NAME
-                            )
+                        IndexCacheSchedulerTracker.get_or_create(
+                            ENGINE_NAME
                         )
-            if self._indexcache_blender_ref is not None:
+                    )
+            # TP>1 tracker: use signal file to drive reset and
+            # chunk accumulation instead of auto-populate heuristic.
+            if isinstance(
+                self._indexcache_blender_ref, IndexCacheSchedulerTracker
+            ):
+                tracker = self._indexcache_blender_ref
+                signal = self._ic_read_signal()
+                if signal is not None:
+                    sig_entry_id = signal["entry_id"]
+                    if sig_entry_id != self._ic_current_entry_id:
+                        logger.info(
+                            "IndexCache scheduler: new entry %s, "
+                            "resetting tracker",
+                            sig_entry_id,
+                        )
+                        tracker.reset()
+                        self._ic_current_entry_id = sig_entry_id
+                        self._ic_expected_chunks = signal["expected_chunks"]
+                        self._ic_chunks_processed = 0
+
+                num_external_hit_tokens = tracker.lookup(token_ids)
+                # Accumulate chunk tokens when lookup returns 0 and
+                # we haven't finished all expected chunks yet.
+                if (
+                    num_external_hit_tokens == 0
+                    and self._ic_chunks_processed
+                    < self._ic_expected_chunks
+                ):
+                    tok_list = (
+                        token_ids.tolist()
+                        if hasattr(token_ids, "tolist")
+                        else list(token_ids)
+                    )
+                    tracker.add_chunk(tok_list)
+                    self._ic_chunks_processed += 1
+                    logger.info(
+                        "IndexCache scheduler: added chunk %d/%d "
+                        "(%d tokens) for entry %s",
+                        self._ic_chunks_processed,
+                        self._ic_expected_chunks,
+                        len(tok_list),
+                        self._ic_current_entry_id,
+                    )
+            elif self._indexcache_blender_ref is not None:
+                # TP=1: direct blender lookup
                 num_external_hit_tokens = (
                     self._indexcache_blender_ref.lookup(token_ids)
                 )
-                # Auto-populate tracker: when lookup returns 0, this is
-                # a cache-gen chunk. Record its tokens so subsequent
-                # requests with a matching prefix get a hit.
-                # This is needed for TP>1 where the test script and the
-                # scheduler (EngineCore) are in different processes.
-                if (
-                    num_external_hit_tokens == 0
-                    and isinstance(
-                        self._indexcache_blender_ref,
-                        IndexCacheSchedulerTracker,
-                    )
-                ):
-                    if hasattr(token_ids, "tolist"):
-                        self._indexcache_blender_ref.add_chunk(
-                            token_ids.tolist()
-                        )
-                    else:
-                        self._indexcache_blender_ref.add_chunk(
-                            list(token_ids)
-                        )
             else:
                 num_external_hit_tokens = 0
         elif self.skip_last_n_tokens > 0:
