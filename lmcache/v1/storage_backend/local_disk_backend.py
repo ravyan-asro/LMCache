@@ -76,6 +76,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.loop = loop
         self.put_tasks: List[CacheEngineKey] = []
+        self._clear_generation = 0  # bumped on each clear()
 
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
@@ -344,8 +345,9 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.loop.is_running(), self.loop.is_closed(),
             )
 
+        gen = self._clear_generation
         future = asyncio.run_coroutine_threadsafe(
-            self.async_save_bytes_to_disk(key, memory_obj), self.loop
+            self.async_save_bytes_to_disk(key, memory_obj, gen), self.loop
         )
         return future
 
@@ -483,6 +485,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        generation: int = -1,
     ) -> None:
         """
         Convert KV to bytes and async store bytes to disk.
@@ -539,6 +542,24 @@ class LocalDiskBackend(StorageBackendInterface):
                     key.chunk_hash[:16], key.layer_id, path,
                 )
 
+            # If a clear() happened after this write was submitted,
+            # do NOT insert into the dict — the file will be deleted
+            # by shutil.rmtree and inserting would create a stale entry.
+            if generation >= 0 and generation != self._clear_generation:
+                if is_layer0:
+                    logger.info(
+                        "async_save STALE (gen %d != %d): hash=%s layer=%d, "
+                        "skipping insert",
+                        generation, self._clear_generation,
+                        key.chunk_hash[:16], key.layer_id,
+                    )
+                memory_obj.ref_count_down()
+                self.disk_lock.acquire()
+                if key in self.put_tasks:
+                    self.put_tasks.remove(key)
+                self.disk_lock.release()
+                return
+
             self.insert_key(key, memory_obj)
 
             if is_layer0:
@@ -550,7 +571,8 @@ class LocalDiskBackend(StorageBackendInterface):
             memory_obj.ref_count_down()
 
             self.disk_lock.acquire()
-            self.put_tasks.remove(key)
+            if key in self.put_tasks:
+                self.put_tasks.remove(key)
             self.disk_lock.release()
         except Exception as e:
             logger.error(
@@ -706,8 +728,16 @@ class LocalDiskBackend(StorageBackendInterface):
         Clear all cached KV chunks from disk.
         Returns the number of cleared keys.
         """
+        # Bump generation so in-flight async writes skip insert_key
+        self._clear_generation += 1
+        logger.info(
+            "disk clear: generation=%d, dict_size=%d, pending_puts=%d",
+            self._clear_generation, len(self.dict), len(self.put_tasks),
+        )
         with self.disk_lock:
             clear_keys = list(self.dict.keys())
+            # Also discard pending put_tasks — they belong to the old gen
+            self.put_tasks.clear()
         for key in clear_keys:
             self.remove(key)
         # Reset evictor's size counter so it matches the now-empty disk
