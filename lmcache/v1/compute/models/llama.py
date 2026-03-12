@@ -47,6 +47,11 @@ class LMCLlamaModel(nn.Module):
         # if we want to make this LMCModel more general.
         self.blender = blender
 
+        # Detect QK-norm (e.g. Qwen3 MoE) — must be applied between
+        # QKV split and RoPE.
+        attn0 = vllm_model.model.layers[0].self_attn
+        self.has_qk_norm = hasattr(attn0, "q_norm") and hasattr(attn0, "k_norm")
+
         rotary_emb = vllm_model.model.layers[0].self_attn.rotary_emb
         head_dim = rotary_emb.head_size
         max_position_embeddings = rotary_emb.max_position_embeddings
@@ -114,6 +119,18 @@ class LMCLlamaModel(nn.Module):
                 ],
                 dim=-1,
             )
+
+            # QK-norm (Qwen3 MoE and similar models)
+            if self.has_qk_norm:
+                num_heads = self.vllm_attn_layers[idx].num_heads
+                num_kv_heads = self.vllm_attn_layers[idx].num_kv_heads
+                head_size = self.vllm_attn_layers[idx].head_size
+                q = layer.self_attn.q_norm(
+                    q.view(*q.shape[:-1], num_heads, head_size)
+                ).view(q.shape)
+                k = layer.self_attn.k_norm(
+                    k.view(*k.shape[:-1], num_kv_heads, head_size)
+                ).view(k.shape)
 
             q, k, v, residual, attn_output, attn_metadata = self.blender.process_qkv(
                 q, k, v, residual, idx, attn_output, attn_metadata

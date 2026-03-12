@@ -185,7 +185,11 @@ class IndexCacheBlender:
         )
 
         # Compute and save sparsity + size stats (rank 0 only for TP>1)
-        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        try:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+        except Exception:
+            rank = 0
         if rank == 0:
             self._compute_and_save_stats(total_seqlen, question_len)
 
