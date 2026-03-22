@@ -24,32 +24,53 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
-    from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
+    try:
+        from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
+    except ImportError:
+        pass
 
-# Third Party
-from vllm.attention import AttentionMetadata
-
-# from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+# Third Party — handle vLLM v0.9.x vs v0.18+ import path changes
 try:
-    # Third Party
+    from vllm.attention import AttentionMetadata
+except ImportError:
+    from vllm.v1.attention.backend import AttentionMetadata  # type: ignore[no-redef]
+
+try:
     from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 except (ModuleNotFoundError, ImportError):
-    # vllm_flash_attn is not installed, try the ROCm FA metadata
-    from vllm.attention.backends.rocm_flash_attn import (
-        ROCmFlashAttentionMetadata as FlashAttentionMetadata,
-    )
+    try:
+        from vllm.attention.backends.rocm_flash_attn import (
+            ROCmFlashAttentionMetadata as FlashAttentionMetadata,
+        )
+    except (ModuleNotFoundError, ImportError):
+        try:
+            from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata  # type: ignore[no-redef]
+        except (ModuleNotFoundError, ImportError):
+            FlashAttentionMetadata = None  # type: ignore[assignment,misc]
 
-# Third Party
-from vllm.attention.backends.flashmla import FlashMLAMetadata
-from vllm.attention.backends.mla.common import MLACommonMetadata
+try:
+    from vllm.attention.backends.flashmla import FlashMLAMetadata
+    from vllm.attention.backends.mla.common import MLACommonMetadata
+except (ModuleNotFoundError, ImportError):
+    FlashMLAMetadata = None  # type: ignore[assignment,misc]
+    MLACommonMetadata = None  # type: ignore[assignment,misc]
+
 from vllm.config import (
     CacheConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
 )
-from vllm.sequence import IntermediateTensors
-from vllm.utils import cdiv, get_kv_cache_torch_dtype, round_down
+try:
+    from vllm.sequence import IntermediateTensors
+except ImportError:
+    IntermediateTensors = None  # type: ignore[assignment,misc]
+
+try:
+    from vllm.utils import cdiv, get_kv_cache_torch_dtype, round_down
+except ImportError:
+    from vllm.utils.math_utils import cdiv, round_down  # type: ignore[no-redef]
+    from vllm.utils.torch_utils import get_kv_cache_torch_dtype  # type: ignore[no-redef]
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata

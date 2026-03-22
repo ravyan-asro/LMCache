@@ -18,7 +18,10 @@ from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.attention.backends.abstract import AttentionMetadata
+    try:
+        from vllm.attention.backends.abstract import AttentionMetadata
+    except ImportError:
+        from vllm.v1.attention.backend import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.request import Request
 

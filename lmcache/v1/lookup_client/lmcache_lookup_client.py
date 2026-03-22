@@ -17,7 +17,10 @@ from typing import TYPE_CHECKING, Optional
 import threading
 
 # Third Party
-from vllm.utils import make_zmq_socket
+try:
+    from vllm.utils import make_zmq_socket
+except ImportError:
+    from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 import torch
 import vllm.envs as envs

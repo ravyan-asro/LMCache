@@ -19,7 +19,10 @@ from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.attention.backends.abstract import AttentionMetadata
+    try:
+        from vllm.attention.backends.abstract import AttentionMetadata
+    except ImportError:
+        from vllm.v1.attention.backend import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
@@ -28,8 +31,10 @@ logger = init_logger(__name__)
 
 
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config=vllm_config, role=role)
+    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole,
+                 kv_cache_config=None):
+        super().__init__(vllm_config=vllm_config, role=role,
+                         kv_cache_config=kv_cache_config)
         self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
 
     # ==============================
@@ -121,7 +126,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[Optional[int], bool]:
         """
         Get number of new tokens that can be loaded from the
         external KV cache beyond the num_computed_tokens.
@@ -177,3 +182,23 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    # ==============================
+    # New methods in vLLM 0.18+
+    # ==============================
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        if hasattr(self._lmcache_engine, "register_kv_caches"):
+            self._lmcache_engine.register_kv_caches(kv_caches)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if hasattr(self._lmcache_engine, "get_block_ids_with_load_errors"):
+            return self._lmcache_engine.get_block_ids_with_load_errors()
+        return set()
+
+    def handle_preemptions(self, preempted_req_ids: set[str]):
+        if hasattr(self._lmcache_engine, "handle_preemptions"):
+            self._lmcache_engine.handle_preemptions(preempted_req_ids)
+
+    def shutdown(self):
+        if hasattr(self._lmcache_engine, "shutdown"):
+            self._lmcache_engine.shutdown()

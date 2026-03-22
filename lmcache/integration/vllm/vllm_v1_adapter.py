@@ -23,7 +23,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
-from vllm.utils import cdiv
+try:
+    from vllm.utils import cdiv
+except ImportError:
+    from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
 import torch
 
@@ -45,7 +48,10 @@ from lmcache.v1.lookup_client import LookupClientFactory
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.attention.backends.abstract import AttentionMetadata
+    try:
+        from vllm.attention.backends.abstract import AttentionMetadata
+    except ImportError:
+        from vllm.v1.attention.backend import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.kv_cache_manager import KVCacheManager
