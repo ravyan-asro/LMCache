@@ -157,6 +157,20 @@ class LMCIndexCacheLlamaModel(nn.Module):
         positions = torch.arange(seq_len, device=input_ids.device)
         mh_set = self.config.misbehaving_heads_set
 
+        # Disable vLLM 0.18+ MoE layer tracking during manual forward
+        # to avoid "all_moe_layers" count mismatch.
+        try:
+            from vllm.forward_context import get_forward_context
+            ctx = get_forward_context()
+            saved_moe_layers = ctx.all_moe_layers
+            saved_moe_idx = ctx.moe_layer_index
+            ctx.all_moe_layers = None
+            ctx.moe_layer_index = 0
+        except Exception:
+            ctx = None
+            saved_moe_layers = None
+            saved_moe_idx = 0
+
         hidden_states = self._embed(input_ids.cuda())
         residual = None
 
@@ -246,6 +260,11 @@ class LMCIndexCacheLlamaModel(nn.Module):
 
             yield (kvcolidx, la_hot_tile)
 
+        # Restore MoE tracking after manual forward
+        if ctx is not None:
+            ctx.all_moe_layers = saved_moe_layers
+            ctx.moe_layer_index = saved_moe_idx
+
     # ------------------------------------------------------------------
     # Prefill: lean_attn sparse attention + write KV to paged buffer
     # ------------------------------------------------------------------
@@ -286,6 +305,19 @@ class LMCIndexCacheLlamaModel(nn.Module):
         import lmcache.c_ops as lmc_ops
 
         seq_len = input_ids.shape[0]
+
+        # Disable vLLM 0.18+ MoE layer tracking during manual forward
+        try:
+            from vllm.forward_context import get_forward_context
+            ctx = get_forward_context()
+            saved_moe_layers = ctx.all_moe_layers
+            saved_moe_idx = ctx.moe_layer_index
+            ctx.all_moe_layers = None
+            ctx.moe_layer_index = 0
+        except Exception:
+            ctx = None
+            saved_moe_layers = None
+            saved_moe_idx = 0
 
         hidden_states = self._embed(input_ids.cuda())
         positions = torch.arange(seq_len, device=hidden_states.device)
@@ -415,3 +447,8 @@ class LMCIndexCacheLlamaModel(nn.Module):
             hidden_states = self._run_mlp(layer, hidden_states)
 
             yield
+
+        # Restore MoE tracking after manual forward
+        if ctx is not None:
+            ctx.all_moe_layers = saved_moe_layers
+            ctx.moe_layer_index = saved_moe_idx
