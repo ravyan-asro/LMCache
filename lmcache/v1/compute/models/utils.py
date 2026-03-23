@@ -30,7 +30,8 @@ logger = init_logger(__name__)
 def infer_model_from_vllm(vllm_model, blender):
     model_name = type(vllm_model).__name__
     if model_name in ("LlamaForCausalLM", "Qwen2ForCausalLM",
-                       "Qwen3ForCausalLM", "Qwen3MoeForCausalLM"):
+                       "Qwen3ForCausalLM", "Qwen3MoeForCausalLM",
+                       "MiniMaxM2ForCausalLM", "GptOssForCausalLM"):
         # First Party
         from lmcache.v1.compute.models.llama import LMCLlamaModel
 
