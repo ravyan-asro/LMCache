@@ -139,8 +139,10 @@ class RequestTracker:
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=lmcache_cached_tokens,
-            mm_hashes=new_request.mm_hashes.copy(),
-            mm_positions=new_request.mm_positions.copy(),
+            mm_hashes=getattr(new_request, "mm_hashes", []).copy()
+                if getattr(new_request, "mm_hashes", None) else [],
+            mm_positions=getattr(new_request, "mm_positions", []).copy()
+                if getattr(new_request, "mm_positions", None) else [],
         )
 
     def update(
@@ -455,7 +457,12 @@ class LMCacheConnectorV1Impl:
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
-        attn_metadata = forward_context.attn_metadata
+        raw_attn_metadata = forward_context.attn_metadata
+        # v0.18+: attn_metadata is dict[str, AttentionMetadata]; extract first value
+        if isinstance(raw_attn_metadata, dict):
+            attn_metadata = next(iter(raw_attn_metadata.values()), None)
+        else:
+            attn_metadata = raw_attn_metadata
         if attn_metadata is None:
             logger.warning("In connector.start_load_kv, but the attn_metadata is None")
             # return
