@@ -30,10 +30,14 @@ def vllm_get_rope(head_size, rotary_dim=None, max_position=8192, base=10000.0,
                   is_neox_style=True, rope_scaling=None, dtype=None,
                   partial_rotary_factor=1.0):
     if _NEW_ROPE_API:
-        # vLLM 0.18+ API
+        # vLLM 0.18+ API: get_rope(head_size, max_position, ...)
+        # Pass full head_size — the RoPE internally handles partial rotation
+        # via rope_parameters (partial_rotary_factor).
         rope_parameters = {"rope_theta": base}
         if rope_scaling is not None:
             rope_parameters.update(rope_scaling)
+        if partial_rotary_factor != 1.0:
+            rope_parameters["partial_rotary_factor"] = partial_rotary_factor
         return _vllm_get_rope_raw(
             head_size, max_position, is_neox_style,
             rope_parameters=rope_parameters, dtype=dtype)
@@ -55,24 +59,24 @@ logger = init_logger(__name__)
 
 
 class BasicReverseRope:
-    def __init__(self, rope, rotary_dim, is_neox_style):
+    def __init__(self, rope, rotary_dim, is_neox_style, head_size=None):
         self.rope = rope
-        self.rotary_dim = rotary_dim
+        # Use the rope's actual head_size — for partial rotary (e.g. MiniMax),
+        # the rope operates on full head_dim and only rotates rotary_dim internally.
+        self.head_size = head_size or rotary_dim
+        self.rotary_dim = self.head_size  # shuffle the full head since rope handles partial
         self.is_neox_style = is_neox_style
 
     def do_shuffle(self, t):
         original_shape = t.shape
-        t = t.reshape(t.shape[0], -1, self.rotary_dim)
+        t = t.reshape(t.shape[0], -1, self.head_size)
 
         if self.is_neox_style:
             o1, o2 = torch.chunk(t, 2, dim=-1)
+            return torch.cat((o2, o1), dim=-1).reshape(original_shape)
         else:
             o1 = t[..., ::2]
             o2 = t[..., 1::2]
-
-        if self.is_neox_style:
-            return torch.cat((o2, o1), dim=-1).reshape(original_shape)
-        else:
             return torch.stack((o2, o1), dim=-1).reshape(original_shape)
 
     def reverse_encode(self, positions, q, k):
@@ -89,14 +93,18 @@ class BasicReverseRope:
 
 class FusedRope:
     """
-    Directly use the fused kernel to ratate K cache from
+    Directly use the fused kernel to rotate K cache from
     the old positions to the new positions.
+
+    For partial rotary (e.g. MiniMax M2.5: rotary_dim=64, head_dim=128),
+    the cos_sin_cache is sized for rotary_dim. The C kernel operates on
+    head_size but only rotates cos_sin_cache.shape[-1]//2 dims per head.
     """
 
-    def __init__(self, rope, is_neox_style):
+    def __init__(self, rope, is_neox_style, head_size=None, rotary_dim=None):
         self.rope = rope
         self.is_neox_style = is_neox_style
-        self.head_size = rope.head_size
+        self.head_size = head_size or rope.head_size
         self.cos_sin_cache = rope.cos_sin_cache
 
     def fused_encode(self, old_positions, new_positions, k):
@@ -127,25 +135,18 @@ def validate_rope_params(
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
 ):
-    if rotary_dim != head_size:
-        logger.error("Currently KV blending only support rotary_dim == head_size.")
-        return False
-
-    #if rope_scaling is not None:
-    #    logger.error("Currently KV blending do not support rope scaling.")
-    #    return False
-
-    if partial_rotary_factor != 1.0:
-        logger.error(
-            "Currently KV blending do not support rotary factor other than 1.0."
-        )
+    # Partial rotary is now supported (e.g. MiniMax M2.5: rotary_dim=64, head_dim=128)
+    if rotary_dim > head_size:
+        logger.error(f"rotary_dim ({rotary_dim}) > head_size ({head_size}).")
         return False
 
     return True
 
 
 def validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size) -> bool:
-    hidden_dim = head_size * 8
+    # Use head_size from fused_rope which knows about partial rotary
+    actual_head_size = getattr(fused_rope, 'head_size', head_size)
+    hidden_dim = actual_head_size * 8
     num_tokens = 10
 
     dumb_q = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
@@ -174,7 +175,7 @@ def validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size) -> b
 
     max_k_error_fused = (k_pos2 - k_pos2_fused).abs().max()
 
-    logger.info(f"Max K error (fused): {max_k_error.item()}")
+    logger.info(f"Max K error (fused): {max_k_error_fused.item()}")
 
     return max_q_error < 0.1 and max_k_error < 0.1 and max_k_error_fused < 0.1
 
@@ -217,8 +218,10 @@ def get_fused_rope(
         partial_rotary_factor,
     )
 
-    reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)
-    fused_rope = FusedRope(rope, is_neox_style)
+    reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style,
+                                     head_size=head_size)
+    fused_rope = FusedRope(rope, is_neox_style,
+                           head_size=head_size, rotary_dim=rotary_dim)
 
     correct = validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size)
     if not correct:

@@ -108,6 +108,20 @@ class LMCLlamaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
     ):
+        # Disable vLLM 0.18+ MoE layer tracking during our manual forward
+        # to avoid "all_moe_layers" count mismatch.
+        try:
+            from vllm.forward_context import get_forward_context
+            ctx = get_forward_context()
+            saved_moe_layers = ctx.all_moe_layers
+            saved_moe_idx = ctx.moe_layer_index
+            ctx.all_moe_layers = None
+            ctx.moe_layer_index = 0
+        except Exception:
+            ctx = None
+            saved_moe_layers = None
+            saved_moe_idx = 0
+
         hidden_states = self._embed(input_ids.cuda())
         residual = None
 
@@ -205,3 +219,8 @@ class LMCLlamaModel(nn.Module):
             hidden_states = getattr(layer, self.mlp_attr)(hidden_states)
 
             yield
+
+        # Restore MoE tracking after manual forward completes
+        if ctx is not None:
+            ctx.all_moe_layers = saved_moe_layers
+            ctx.moe_layer_index = saved_moe_idx
