@@ -69,6 +69,15 @@ class LMCIndexCacheLlamaModel(nn.Module):
         super().__init__()
         self.vllm_model = vllm_model
         self.config = config
+
+        # Compat: vLLM 0.18+ uses embed_input_ids(), older uses get_input_embeddings()
+        if hasattr(vllm_model, "embed_input_ids"):
+            self._embed = vllm_model.embed_input_ids
+        elif hasattr(vllm_model, "get_input_embeddings"):
+            self._embed = vllm_model.get_input_embeddings
+        else:
+            self._embed = vllm_model.model.embed_tokens
+
         self.num_layers = len(vllm_model.model.layers)
 
         # Extract head geometry from the first layer's attention
@@ -81,9 +90,53 @@ class LMCIndexCacheLlamaModel(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
-        # Detect QK-norm (e.g. Qwen3 MoE) — must be applied between
-        # QKV split and RoPE.
+        # Detect QK-norm (e.g. Qwen3 MoE, MiniMax M2.5)
         self.has_qk_norm = hasattr(attn0, "q_norm") and hasattr(attn0, "k_norm")
+
+        # Detect MiniMax-style QK-norm (uses static forward_qk method)
+        self.minimax_qk_norm = False
+        if self.has_qk_norm:
+            try:
+                from vllm.model_executor.layers.mamba.linear_attn import (
+                    MiniMaxText01RMSNormTP,
+                )
+                if isinstance(attn0.q_norm, MiniMaxText01RMSNormTP):
+                    self.minimax_qk_norm = True
+            except ImportError:
+                pass
+
+        # Detect MLP attribute name
+        layer0 = vllm_model.model.layers[0]
+        if hasattr(layer0, "mlp"):
+            self.mlp_attr = "mlp"
+        elif hasattr(layer0, "block_sparse_moe"):
+            self.mlp_attr = "block_sparse_moe"
+        else:
+            raise ValueError("Cannot find MLP/MoE attribute on model layer")
+
+    def _apply_qk_norm(self, layer, q, k):
+        """Apply QK-norm with compat for Qwen3 and MiniMax styles."""
+        if not self.has_qk_norm:
+            return q, k
+        if self.minimax_qk_norm:
+            from vllm.model_executor.layers.mamba.linear_attn import (
+                MiniMaxText01RMSNormTP,
+            )
+            return MiniMaxText01RMSNormTP.forward_qk(
+                layer.self_attn.q_norm, layer.self_attn.k_norm, q, k
+            )
+        else:
+            q = layer.self_attn.q_norm(
+                q.view(*q.shape[:-1], self.num_heads, self.head_dim)
+            ).view(q.shape)
+            k = layer.self_attn.k_norm(
+                k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
+            ).view(k.shape)
+            return q, k
+
+    def _run_mlp(self, layer, hidden_states):
+        """Run MLP/MoE on a layer."""
+        return getattr(layer, self.mlp_attr)(hidden_states)
 
     # ------------------------------------------------------------------
     # Cache Gen: dense attention for metadata extraction
@@ -104,7 +157,7 @@ class LMCIndexCacheLlamaModel(nn.Module):
         positions = torch.arange(seq_len, device=input_ids.device)
         mh_set = self.config.misbehaving_heads_set
 
-        hidden_states = self.vllm_model.get_input_embeddings(input_ids.cuda())
+        hidden_states = self._embed(input_ids.cuda())
         residual = None
 
         for layer_idx in range(self.num_layers):
@@ -125,14 +178,8 @@ class LMCIndexCacheLlamaModel(nn.Module):
                 [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
 
-            # --- QK-norm (Qwen3 MoE and similar models) ---
-            if self.has_qk_norm:
-                q = layer.self_attn.q_norm(
-                    q.view(*q.shape[:-1], self.num_heads, self.head_dim)
-                ).view(q.shape)
-                k = layer.self_attn.k_norm(
-                    k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
-                ).view(k.shape)
+            # --- QK-norm (Qwen3 MoE, MiniMax M2.5, and similar models) ---
+            q, k = self._apply_qk_norm(layer, q, k)
 
             # --- RoPE ---
             q, k = layer.self_attn.rotary_emb(positions, q, k)
@@ -195,7 +242,7 @@ class LMCIndexCacheLlamaModel(nn.Module):
             hidden_states, residual = layer.post_attention_layernorm(
                 hidden_states, residual
             )
-            hidden_states = layer.mlp(hidden_states)
+            hidden_states = self._run_mlp(layer, hidden_states)
 
             yield (kvcolidx, la_hot_tile)
 
@@ -240,7 +287,7 @@ class LMCIndexCacheLlamaModel(nn.Module):
 
         seq_len = input_ids.shape[0]
 
-        hidden_states = self.vllm_model.get_input_embeddings(input_ids.cuda())
+        hidden_states = self._embed(input_ids.cuda())
         positions = torch.arange(seq_len, device=hidden_states.device)
         residual = None
 
@@ -262,14 +309,8 @@ class LMCIndexCacheLlamaModel(nn.Module):
                 [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
 
-            # --- QK-norm (Qwen3 MoE and similar models) ---
-            if self.has_qk_norm:
-                q = layer.self_attn.q_norm(
-                    q.view(*q.shape[:-1], self.num_heads, self.head_dim)
-                ).view(q.shape)
-                k = layer.self_attn.k_norm(
-                    k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
-                ).view(k.shape)
+            # --- QK-norm (Qwen3 MoE, MiniMax M2.5, and similar models) ---
+            q, k = self._apply_qk_norm(layer, q, k)
 
             # --- RoPE ---
             q, k = layer.self_attn.rotary_emb(positions, q, k)
@@ -371,6 +412,6 @@ class LMCIndexCacheLlamaModel(nn.Module):
             hidden_states, residual = layer.post_attention_layernorm(
                 hidden_states, residual
             )
-            hidden_states = layer.mlp(hidden_states)
+            hidden_states = self._run_mlp(layer, hidden_states)
 
             yield

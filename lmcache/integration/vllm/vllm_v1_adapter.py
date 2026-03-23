@@ -156,7 +156,7 @@ class RequestTracker:
 
         self.token_ids.extend(new_token_ids)
 
-        if len(new_block_ids) == 0:
+        if new_block_ids is None or len(new_block_ids) == 0:
             new_block_ids = []
         else:
             assert isinstance(new_block_ids[0], list), (
@@ -887,6 +887,13 @@ class LMCacheConnectorV1Impl:
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         return None, None
 
+    def get_kv_events(self):
+        """Return KV cache events for the v0.18 connector stats pipeline."""
+        return []
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        return set()
+
     ###################
     # Scheduler side APIs
     ####################
@@ -917,9 +924,10 @@ class LMCacheConnectorV1Impl:
         token_ids = torch.tensor(request.prompt_token_ids)
 
         # If the request has multimodal hashes, apply them to the token ids
-        if request.mm_hashes:
+        if getattr(request, "mm_hashes", None):
             apply_mm_hashes_to_token_ids(
-                token_ids, request.mm_hashes, request.mm_positions
+                token_ids, request.mm_hashes,
+                getattr(request, "mm_positions", [])
             )
 
         # IndexCache: check metadata store instead of LMCache storage.

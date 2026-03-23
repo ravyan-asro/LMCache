@@ -13,9 +13,19 @@
 # limitations under the License.
 
 # Third Party
-from vllm.attention import Attention
-from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
-from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata
+try:
+    from vllm.attention import Attention
+except ImportError:
+    from vllm.model_executor.layers.attention import Attention
+try:
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+except ImportError:
+    FlashAttentionImpl = None
+try:
+    from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata
+except ImportError:
+    from vllm.third_party.flashinfer.flashattn_hopper import flash_attn_varlen_func
+    get_scheduler_metadata = None
 import torch
 
 # First Party

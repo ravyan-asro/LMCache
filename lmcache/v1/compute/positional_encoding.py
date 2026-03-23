@@ -16,7 +16,32 @@
 from typing import Any, Callable, Dict, Optional
 
 # Third Party
-from vllm.model_executor.layers.rotary_embedding import get_rope as vllm_get_rope
+from vllm.model_executor.layers.rotary_embedding import get_rope as _vllm_get_rope_raw
+import inspect
+
+# Compat wrapper: vLLM 0.18+ changed get_rope signature from
+#   (head_size, rotary_dim, max_position, base, is_neox_style, rope_scaling, dtype, ...)
+# to:
+#   (head_size, max_position, is_neox_style=True, rope_parameters=None, dtype=None, ...)
+_get_rope_params = inspect.signature(_vllm_get_rope_raw).parameters
+_NEW_ROPE_API = "rope_parameters" in _get_rope_params
+
+def vllm_get_rope(head_size, rotary_dim=None, max_position=8192, base=10000.0,
+                  is_neox_style=True, rope_scaling=None, dtype=None,
+                  partial_rotary_factor=1.0):
+    if _NEW_ROPE_API:
+        # vLLM 0.18+ API
+        rope_parameters = {"rope_theta": base}
+        if rope_scaling is not None:
+            rope_parameters.update(rope_scaling)
+        return _vllm_get_rope_raw(
+            head_size, max_position, is_neox_style,
+            rope_parameters=rope_parameters, dtype=dtype)
+    else:
+        # vLLM 0.9.x API
+        return _vllm_get_rope_raw(
+            head_size, rotary_dim, max_position, base,
+            is_neox_style, rope_scaling, dtype, partial_rotary_factor)
 import torch
 
 # First Party

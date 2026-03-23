@@ -34,6 +34,14 @@ class LMCLlamaModel(nn.Module):
         super().__init__()
         self.vllm_model = vllm_model
 
+        # Compat: vLLM 0.18+ uses embed_input_ids(), older uses get_input_embeddings()
+        if hasattr(vllm_model, "embed_input_ids"):
+            self._embed = vllm_model.embed_input_ids
+        elif hasattr(vllm_model, "get_input_embeddings"):
+            self._embed = vllm_model.get_input_embeddings
+        else:
+            self._embed = vllm_model.model.embed_tokens
+
         self.num_layers = len(vllm_model.model.layers)
 
         self.vllm_attn_layers = []
@@ -47,10 +55,31 @@ class LMCLlamaModel(nn.Module):
         # if we want to make this LMCModel more general.
         self.blender = blender
 
-        # Detect QK-norm (e.g. Qwen3 MoE) — must be applied between
-        # QKV split and RoPE.
+        # Detect QK-norm (e.g. Qwen3 MoE, MiniMax M2.5) — must be applied
+        # between QKV split and RoPE.
         attn0 = vllm_model.model.layers[0].self_attn
         self.has_qk_norm = hasattr(attn0, "q_norm") and hasattr(attn0, "k_norm")
+
+        # Detect MiniMax-style QK-norm (uses static forward_qk method)
+        self.minimax_qk_norm = False
+        if self.has_qk_norm:
+            try:
+                from vllm.model_executor.layers.mamba.linear_attn import (
+                    MiniMaxText01RMSNormTP,
+                )
+                if isinstance(attn0.q_norm, MiniMaxText01RMSNormTP):
+                    self.minimax_qk_norm = True
+            except ImportError:
+                pass
+
+        # Detect MLP attribute name: 'mlp' (Llama) or 'block_sparse_moe' (MiniMax)
+        layer0 = vllm_model.model.layers[0]
+        if hasattr(layer0, "mlp"):
+            self.mlp_attr = "mlp"
+        elif hasattr(layer0, "block_sparse_moe"):
+            self.mlp_attr = "block_sparse_moe"
+        else:
+            raise ValueError("Cannot find MLP/MoE attribute on model layer")
 
         rotary_emb = vllm_model.model.layers[0].self_attn.rotary_emb
         head_dim = rotary_emb.head_size
@@ -59,10 +88,15 @@ class LMCLlamaModel(nn.Module):
         is_neox_style = rotary_emb.is_neox_style
         dtype = rotary_emb.dtype
 
+        # Detect partial rotary (e.g. MiniMax M2.5: rotary_dim=64, head_dim=128)
+        rotary_dim = getattr(vllm_model.config, 'rotary_dim',
+                    getattr(vllm_model.config, 'partial_rotary_factor', 1.0) * head_dim)
+        rotary_dim = int(rotary_dim) if rotary_dim != head_dim else head_dim
+
         rope_scaling = getattr(vllm_model.config, 'rope_scaling', None)
         self.fused_rotary_emb = get_fused_rope(
             head_dim,
-            rotary_dim=head_dim,
+            rotary_dim=rotary_dim,
             max_position=max_position_embeddings,
             base=base,
             rope_scaling=rope_scaling,
@@ -74,7 +108,7 @@ class LMCLlamaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
     ):
-        hidden_states = self.vllm_model.get_input_embeddings(input_ids.cuda())
+        hidden_states = self._embed(input_ids.cuda())
         residual = None
 
         # TODO (Jiayi): reduce the number of calls
@@ -120,17 +154,26 @@ class LMCLlamaModel(nn.Module):
                 dim=-1,
             )
 
-            # QK-norm (Qwen3 MoE and similar models)
+            # QK-norm (Qwen3 MoE, MiniMax M2.5, and similar models)
             if self.has_qk_norm:
                 num_heads = self.vllm_attn_layers[idx].num_heads
                 num_kv_heads = self.vllm_attn_layers[idx].num_kv_heads
                 head_size = self.vllm_attn_layers[idx].head_size
-                q = layer.self_attn.q_norm(
-                    q.view(*q.shape[:-1], num_heads, head_size)
-                ).view(q.shape)
-                k = layer.self_attn.k_norm(
-                    k.view(*k.shape[:-1], num_kv_heads, head_size)
-                ).view(k.shape)
+                if self.minimax_qk_norm:
+                    # MiniMax uses static forward_qk for TP-synchronized QK-norm
+                    from vllm.model_executor.layers.mamba.linear_attn import (
+                        MiniMaxText01RMSNormTP,
+                    )
+                    q, k = MiniMaxText01RMSNormTP.forward_qk(
+                        layer.self_attn.q_norm, layer.self_attn.k_norm, q, k
+                    )
+                else:
+                    q = layer.self_attn.q_norm(
+                        q.view(*q.shape[:-1], num_heads, head_size)
+                    ).view(q.shape)
+                    k = layer.self_attn.k_norm(
+                        k.view(*k.shape[:-1], num_kv_heads, head_size)
+                    ).view(k.shape)
 
             q, k, v, residual, attn_output, attn_metadata = self.blender.process_qkv(
                 q, k, v, residual, idx, attn_output, attn_metadata
@@ -159,6 +202,6 @@ class LMCLlamaModel(nn.Module):
             hidden_states, residual = layer.post_attention_layernorm(
                 hidden_states, residual
             )
-            hidden_states = layer.mlp(hidden_states)
+            hidden_states = getattr(layer, self.mlp_attr)(hidden_states)
 
             yield
