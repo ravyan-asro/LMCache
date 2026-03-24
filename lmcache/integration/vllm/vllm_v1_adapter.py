@@ -335,7 +335,9 @@ class LMCacheConnectorV1Impl:
             self._indexcache_blender_ref = None
 
             # IndexCache TP>1 state (scheduler side)
-            self._ic_signal_path = "/tmp/indexcache_signal.json"
+            _gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+            _first_gpu = _gpus.split(",")[0].strip()
+            self._ic_signal_path = f"/tmp/indexcache_signal_gpu{_first_gpu}.json"
             self._ic_current_entry_id: Optional[str] = None
             self._ic_chunks_processed: int = 0
             self._ic_expected_chunks: int = 0
@@ -375,7 +377,9 @@ class LMCacheConnectorV1Impl:
                 logger.info("IndexCache mode enabled")
 
             # IndexCache TP>1 state machine (driven by signal file)
-            self._ic_signal_path = "/tmp/indexcache_signal.json"
+            _gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+            _first_gpu = _gpus.split(",")[0].strip()
+            self._ic_signal_path = f"/tmp/indexcache_signal_gpu{_first_gpu}.json"
             self._ic_current_entry_id: Optional[str] = None
             self._ic_chunks_processed: int = 0
             self._ic_expected_chunks: int = 0
