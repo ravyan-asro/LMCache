@@ -41,9 +41,9 @@ def _get_fa3():
         if fa3_path not in sys.path:
             sys.path.insert(0, fa3_path)
         from flash_attn_interface import _flash_attn_forward
-        from sparse_indexcache_utils import build_indexcache_metadata
+        from indexcache_inflate import build_indexcache_metadata_gpu
         _flash_attn_forward_func = _flash_attn_forward
-        _build_indexcache_metadata_func = build_indexcache_metadata
+        _build_indexcache_metadata_func = build_indexcache_metadata_gpu
     return _flash_attn_forward_func, _build_indexcache_metadata_func
 
 
@@ -372,10 +372,6 @@ class LMCIndexCacheLlamaModel(nn.Module):
                         question_len=question_len,
                         kvcolidx_cache=kvcolidx,
                         la_hot_tile_code_cache=la_hot_tile,
-                        num_heads_kv=self.num_kv_heads,
-                        kBlockM=128,
-                        kBlockN=128,
-                        page_size=page_size,
                         device=str(q.device),
                     )
 

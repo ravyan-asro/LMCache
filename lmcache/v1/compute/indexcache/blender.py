@@ -117,9 +117,6 @@ class IndexCacheBlender:
             logger.warning("precompute_sparse_metadata: no chunk metadata")
             return
 
-        from lmcache.v1.compute.models.indexcache_llama import _get_fa3
-        _, build_meta = _get_fa3()
-
         # Merge metadata (same logic as blend())
         page_size = self.config.page_size
         offset_list = list(
@@ -131,57 +128,85 @@ class IndexCacheBlender:
             pages_before.append(pages_before[-1] + np)
 
         num_chunks = len(self.chunk_metadata)
+        num_layers = self.model.num_layers
 
+        import sys
+        fa3_path = "/var/tmp/rsanovar3/flash-attention/hopper"
+        if fa3_path not in sys.path:
+            sys.path.insert(0, fa3_path)
+        from indexcache_inflate import build_indexcache_metadata_gpu_all_layers
+
+        torch.cuda.synchronize()
         t0 = time.time()
-        self._precomputed_sparse_metadata = []
 
-        for layer_idx in range(self.model.num_layers):
-            # Merge kvcolidx (exclude last chunk)
+        # --- CPU→GPU transfer: stack per-chunk on CPU, bulk .to(device) ---
+        chunk_kv_gpu = []
+        for chunk_idx in range(num_chunks - 1):
+            meta = self.chunk_metadata[chunk_idx]
+            stacked = torch.stack(meta[1], dim=0)
+            chunk_kv_gpu.append(stacked.to(device))
+
+        chunk_ht_gpu = []
+        for chunk_idx in range(num_chunks):
+            meta = self.chunk_metadata[chunk_idx]
+            stacked = torch.stack(meta[2], dim=0)
+            chunk_ht_gpu.append(stacked.to(device))
+
+        # Merge across chunks per-layer + stack into contiguous tensors
+        merged_kv_list = []
+        merged_ht_list = []
+        for layer_idx in range(num_layers):
             kvcolidx_list = []
             for chunk_idx in range(num_chunks - 1):
-                meta = self.chunk_metadata[chunk_idx]
-                kv = meta[1][layer_idx].to(device)
+                kv = chunk_kv_gpu[chunk_idx][layer_idx]
                 offset = pages_before[chunk_idx]
                 if offset > 0:
                     kv = torch.where(kv >= 0, kv + offset, kv)
                 kvcolidx_list.append(kv)
             if kvcolidx_list:
-                merged_kv = torch.cat(kvcolidx_list, dim=-1)
+                merged_kv_list.append(torch.cat(kvcolidx_list, dim=-1))
             else:
                 B = self.chunk_metadata[0][1][layer_idx].shape[0]
                 H = self.chunk_metadata[0][1][layer_idx].shape[1]
-                merged_kv = torch.empty(
-                    B, H, 0, dtype=torch.long, device=device
+                merged_kv_list.append(
+                    torch.empty(B, H, 0, dtype=torch.long, device=device)
                 )
+            merged_ht_list.append(torch.cat(
+                [chunk_ht_gpu[ci][layer_idx] for ci in range(num_chunks)],
+                dim=-1,
+            ))
 
-            # Merge hot_tile (all chunks)
-            hot_tile_list = [
-                meta[2][layer_idx].to(device)
-                for meta in self.chunk_metadata
-            ]
-            merged_ht = torch.cat(hot_tile_list, dim=-1)
+        kvcolidx_stacked = torch.stack(
+            [t.squeeze(0) for t in merged_kv_list], dim=0
+        ).contiguous()
+        la_stacked = torch.stack(
+            [t.squeeze(0) for t in merged_ht_list], dim=0
+        ).contiguous()
 
-            # Convert to FA3 sparse format
-            indices, offsets, mask_counts = build_meta(
+        torch.cuda.synchronize()
+        t_transfer = time.time()
+        transfer_ms = (t_transfer - t0) * 1000
+
+        # --- CUDA inflate kernel (all layers, single launch) ---
+        self._precomputed_sparse_metadata = \
+            build_indexcache_metadata_gpu_all_layers(
                 seqlen_total=total_seqlen,
                 offset_list=offset_list,
                 question_len=question_len,
-                kvcolidx_cache=merged_kv.contiguous(),
-                la_hot_tile_code_cache=merged_ht.contiguous(),
-                num_heads_kv=self.model.num_kv_heads,
-                kBlockM=128,
-                kBlockN=128,
-                page_size=page_size,
+                kvcolidx_per_layer=kvcolidx_stacked,
+                la_hot_tile_code_per_layer=la_stacked,
                 device=device,
             )
-            self._precomputed_sparse_metadata.append(
-                (indices, offsets, mask_counts)
-            )
-
+        torch.cuda.synchronize()
         t1 = time.time()
+        kernel_ms = (t1 - t_transfer) * 1000
+        total_ms = (t1 - t0) * 1000
+
         logger.info(
-            f"FA3 sparse metadata pre-computed for {self.model.num_layers} "
-            f"layers in {t1 - t0:.3f}s (excluded from TTFT)"
+            f"FA3 sparse metadata pre-computed for {num_layers} "
+            f"layers in {total_ms:.1f}ms "
+            f"(cpu_to_gpu: {transfer_ms:.1f}ms, cuda_kernel: {kernel_ms:.1f}ms) "
+            f"— excluded from TTFT"
         )
 
         # Compute and save sparsity + size stats (rank 0 only for TP>1)
@@ -422,10 +447,6 @@ class IndexCacheBlender:
                     question_len=question_len,
                     kvcolidx_cache=kvcolidx,
                     la_hot_tile_code_cache=la_hot_tile,
-                    num_heads_kv=self.model.num_kv_heads,
-                    kBlockM=128,
-                    kBlockN=128,
-                    page_size=self.config.page_size,
                     device=str(device),
                 )
                 sparse_metadata_caches.append(
