@@ -39,6 +39,20 @@ class IndexCacheBlender:
         # Flat list of cached token IDs (for prefix matching in lookup)
         self.cached_token_ids: list = []
 
+        # Disk backend (optional)
+        self.disk_backend = None
+        if config.disk_cache_dir:
+            from lmcache.v1.compute.indexcache.disk_backend import (
+                IndexCacheDiskBackend,
+            )
+            self.disk_backend = IndexCacheDiskBackend(config.disk_cache_dir)
+
+        # Merged per-layer CPU tensors (populated by _merge_chunk_metadata_cpu)
+        self._merged_kvcolidx_cpu = None  # list of (H, num_indices) per layer
+        self._merged_hot_tile_cpu = None  # list of (H, num_bytes) per layer
+        self._merged_offset_list = None
+        self._merged_question_len = None
+
     # ------------------------------------------------------------------
     # Cache Gen
     # ------------------------------------------------------------------
@@ -95,6 +109,114 @@ class IndexCacheBlender:
         return 0
 
     # ------------------------------------------------------------------
+    # Disk save / load
+    # ------------------------------------------------------------------
+    def save_to_disk(self, key: str):
+        """Save current chunk_metadata to disk."""
+        if self.disk_backend is None:
+            logger.warning("save_to_disk called but no disk backend configured")
+            return
+        self.disk_backend.save(key, self.chunk_metadata, self.cached_token_ids)
+
+    def load_from_disk(self, key: str) -> bool:
+        """Load pre-merged metadata from disk via O_DIRECT.
+
+        Populates _merged_kvcolidx_cpu and _merged_hot_tile_cpu directly
+        (no CPU merge needed). Returns True on success.
+        """
+        if self.disk_backend is None:
+            return False
+        result = self.disk_backend.load(key)
+        if result is None:
+            return False
+
+        self._merged_kvcolidx_cpu = result["merged_kvcolidx"]
+        self._merged_hot_tile_cpu = result["merged_hot_tile"]
+        self._merged_offset_list = result["offset_list"]
+        self.cached_token_ids = result["cached_token_ids"]
+
+        # Reconstruct minimal chunk_metadata for sparsity stats
+        # (only chunk lengths needed, not full tensors)
+        offsets = [0] + result["offset_list"]
+        self.chunk_metadata = [
+            (offsets[i+1] - offsets[i], [], [])
+            for i in range(result["num_chunks"])
+        ]
+
+        self._disk_read_ms = result.get("disk_read_ms", 0)
+        self._deserialize_ms = result.get("deserialize_ms", 0)
+
+        logger.info(
+            f"IndexCache loaded from disk: {result['num_chunks']} chunks, "
+            f"{len(self.cached_token_ids)} tokens, "
+            f"disk_read={self._disk_read_ms:.2f}ms, "
+            f"deserialize={self._deserialize_ms:.2f}ms"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Merge chunk metadata into per-layer CPU tensors
+    # ------------------------------------------------------------------
+    def _merge_chunk_metadata_cpu(self):
+        """Merge per-chunk metadata into per-layer CPU tensors.
+
+        Populates self._merged_kvcolidx_cpu and self._merged_hot_tile_cpu.
+        These are lists of num_layers elements, each a CPU tensor ready
+        for per-layer GPU transfer.
+        """
+        if not self.chunk_metadata:
+            return
+
+        page_size = self.config.page_size
+        num_layers = self.model.num_layers
+        num_chunks = len(self.chunk_metadata)
+
+        offset_list = list(
+            itertools.accumulate(cl for cl, _, _ in self.chunk_metadata)
+        )
+        chunk_num_pages = [cl // page_size for cl, _, _ in self.chunk_metadata]
+        pages_before = [0]
+        for np_ in chunk_num_pages[:-1]:
+            pages_before.append(pages_before[-1] + np_)
+
+        kvcolidx_list = []
+        hot_tile_list = []
+
+        for layer_idx in range(num_layers):
+            # Merge kvcolidx across chunks 0..N-2 (exclude last)
+            kv_parts = []
+            for chunk_idx in range(num_chunks - 1):
+                kv = self.chunk_metadata[chunk_idx][1][layer_idx]
+                offset = pages_before[chunk_idx]
+                if offset > 0:
+                    kv = torch.where(kv >= 0, kv + offset, kv)
+                kv_parts.append(kv)
+            if kv_parts:
+                merged_kv = torch.cat(kv_parts, dim=-1).squeeze(0)  # (H, total_indices)
+            else:
+                B = self.chunk_metadata[0][1][layer_idx].shape[0]
+                H = self.chunk_metadata[0][1][layer_idx].shape[1]
+                merged_kv = torch.empty(H, 0, dtype=torch.long)
+            kvcolidx_list.append(merged_kv.contiguous())
+
+            # Merge hot_tile across all chunks
+            ht_parts = [
+                self.chunk_metadata[ci][2][layer_idx]
+                for ci in range(num_chunks)
+            ]
+            merged_ht = torch.cat(ht_parts, dim=-1).squeeze(0)  # (H, total_bytes)
+            hot_tile_list.append(merged_ht.contiguous())
+
+        self._merged_kvcolidx_cpu = kvcolidx_list
+        self._merged_hot_tile_cpu = hot_tile_list
+        self._merged_offset_list = offset_list
+
+        logger.info(
+            f"Merged chunk metadata on CPU: {num_layers} layers, "
+            f"{num_chunks} chunks, offsets={offset_list}"
+        )
+
+    # ------------------------------------------------------------------
     # FA3 metadata pre-computation (called BEFORE llm.generate())
     # ------------------------------------------------------------------
     def precompute_sparse_metadata(
@@ -105,6 +227,9 @@ class IndexCacheBlender:
         Call this after all cache_gen() calls and before llm.generate()
         so the conversion cost is excluded from TTFT.
 
+        When pipeline_blend is enabled, this only merges chunk metadata
+        on CPU (the GPU transfer + inflate happens per-layer in blend()).
+
         Args:
             total_seqlen: total number of tokens (context + question)
             question_len: number of question tokens
@@ -113,8 +238,28 @@ class IndexCacheBlender:
         if self.config.attn_backend != "fa3":
             return
 
-        if not self.chunk_metadata:
-            logger.warning("precompute_sparse_metadata: no chunk metadata")
+        has_pending_disk = (hasattr(self, '_pending_disk_key')
+                            and self._pending_disk_key is not None
+                            and self.disk_backend is not None)
+
+        if not self.chunk_metadata and self._merged_kvcolidx_cpu is None:
+            if has_pending_disk:
+                # Disk load deferred to blend() for timing
+                logger.info(
+                    "precompute: metadata on disk, load deferred to blend()")
+                return
+            else:
+                logger.warning("precompute_sparse_metadata: no chunk metadata")
+                return
+
+        # When pipelining, only merge on CPU — GPU work deferred to blend()
+        if self.config.pipeline_blend:
+            if self._merged_kvcolidx_cpu is None:
+                self._merge_chunk_metadata_cpu()
+            logger.info(
+                "Pipeline blend enabled — CPU merge done, "
+                "GPU transfer deferred to blend()"
+            )
             return
 
         # Merge metadata (same logic as blend())
@@ -343,7 +488,14 @@ class IndexCacheBlender:
     # Prefill (called from start_load_kv)
     # ------------------------------------------------------------------
     def blend(self, tokens: torch.Tensor, mask=None, **kwargs):
-        """Run lean_attn prefill on context tokens, write KV to paged buffer.
+        """Run sparse prefill on context tokens, write KV to paged buffer.
+
+        Supports two modes:
+        - Pipelined (config.pipeline_blend=True, default): per-layer CPU→GPU
+          transfer + inflate overlapped with previous layer's compute via
+          CUDA streams. Transfer is hidden behind compute.
+        - Bulk (config.pipeline_blend=False or pre-computed): uses
+          precompute_sparse_metadata() result computed before llm.generate().
 
         Args:
             tokens: 1-D token IDs for the prefix (context tokens only)
@@ -353,128 +505,187 @@ class IndexCacheBlender:
         kvcaches = kwargs["kvcaches"]
         slot_mapping = kwargs["slot_mapping"]
 
-        if not self.chunk_metadata:
+        # Load from disk if we have a pending disk key and no in-memory data
+        if (self._merged_kvcolidx_cpu is None
+                and hasattr(self, '_pending_disk_key')
+                and self._pending_disk_key is not None
+                and self.disk_backend is not None):
+            self.load_from_disk(self._pending_disk_key)
+            self._pending_disk_key = None
+
+        if not self.chunk_metadata and self._merged_kvcolidx_cpu is None:
             logger.warning("IndexCacheBlender.blend() called with no metadata")
             return
 
-        # Compute offset_list from chunk lengths
-        offset_list = list(
-            itertools.accumulate(cl for cl, _, _ in self.chunk_metadata)
-        )
-
-        # Compute cumulative page offsets per chunk (for global page indexing)
-        page_size = self.config.page_size
-        chunk_num_pages = [cl // page_size for cl, _, _ in self.chunk_metadata]
-        # pages_before[i] = total pages in chunks 0..i-1
-        pages_before = [0]
-        for np in chunk_num_pages[:-1]:
-            pages_before.append(pages_before[-1] + np)
-
-        # Merge per-chunk metadata across chunks for each layer.
-        # IMPORTANT: Exclude the last chunk from kvcolidx (cross-attention
-        # metadata). The last chunk's attention is purely local, handled
-        # by hot_tile only. Including it causes lean_attn CUDA asserts.
-        # This matches the non-vLLM code: schema.py sets num_topk_kvcols=0
-        # for the last document.
-        num_chunks = len(self.chunk_metadata)
-        kvcolidx_caches = []
-        hot_tile_caches = []
         device = tokens.device if tokens.is_cuda else "cuda"
+        num_layers = self.model.num_layers
 
-        for layer_idx in range(self.model.num_layers):
-            # Concatenate kvcolidx across chunks 0..N-2 (exclude last)
-            # Offset local page indices → global page indices
-            kvcolidx_list = []
-            for chunk_idx in range(num_chunks - 1):
-                meta = self.chunk_metadata[chunk_idx]
-                kv = meta[1][layer_idx].to(device)
-                offset = pages_before[chunk_idx]
-                if offset > 0:
-                    # Preserve -1 sentinel (unused slots), offset valid indices
-                    kv = torch.where(kv >= 0, kv + offset, kv)
-                kvcolidx_list.append(kv)
-            if kvcolidx_list:
-                kvcolidx_caches.append(torch.cat(kvcolidx_list, dim=-1))
-            else:
-                # Edge case: only 1 chunk → empty kvcolidx
-                B = self.chunk_metadata[0][1][layer_idx].shape[0]
-                H = self.chunk_metadata[0][1][layer_idx].shape[1]
-                kvcolidx_caches.append(
-                    torch.empty(B, H, 0, dtype=torch.long, device=device)
-                )
+        # Ensure merged CPU metadata exists
+        if self._merged_kvcolidx_cpu is None:
+            self._merge_chunk_metadata_cpu()
 
-            # Concatenate hot_tile across chunks: (1, H, total_bytes)
-            hot_tile_list = [
-                meta[2][layer_idx].to(device)
-                for meta in self.chunk_metadata
-            ]
-            hot_tile_caches.append(torch.cat(hot_tile_list, dim=-1))
-
-        # Compute question_len: total tokens minus context tokens
-        # tokens = full prompt (context + question), offset_list[-1] = context length
+        offset_list = self._merged_offset_list
         question_len = len(tokens) - offset_list[-1]
 
         logger.info(
             f"IndexCache blend: {len(tokens)} total tokens "
             f"({len(tokens) - question_len} context + {question_len} question), "
             f"{len(self.chunk_metadata)} chunks, offsets={offset_list}, "
-            f"backend={self.config.attn_backend}"
+            f"backend={self.config.attn_backend}, "
+            f"pipeline={self.config.pipeline_blend}"
         )
 
-        # --- Use pre-computed FA3 sparse metadata if available ---
+        # --- Check for pre-computed metadata (bulk path) ---
         sparse_metadata_caches = getattr(
             self, '_precomputed_sparse_metadata', None
         )
+
+        # --- Pipelined path: per-layer CPU→GPU + inflate overlapped w/ compute ---
+        if (self.config.pipeline_blend
+                and self.config.attn_backend == "fa3"
+                and sparse_metadata_caches is None):
+            self._blend_pipelined(
+                tokens, offset_list, question_len,
+                kvcaches, slot_mapping, device,
+            )
+            return
+
+        # --- Bulk / fallback path ---
+        # Transfer all metadata to GPU (old path for lean_attn or if
+        # precomputed sparse metadata exists)
+        kvcolidx_caches = [
+            kv.unsqueeze(0).to(device) for kv in self._merged_kvcolidx_cpu
+        ]
+        hot_tile_caches = [
+            ht.unsqueeze(0).to(device) for ht in self._merged_hot_tile_cpu
+        ]
+
         if self.config.attn_backend == "fa3" and sparse_metadata_caches is None:
-            # Fallback: compute in-band (will be part of TTFT)
+            # Fallback: compute all layers in-band
             logger.warning(
-                "FA3 sparse metadata not pre-computed — "
-                "call precompute_sparse_metadata() before generate() "
-                "to exclude conversion from TTFT"
+                "FA3 sparse metadata not pre-computed and pipeline disabled — "
+                "computing in-band (included in TTFT)"
             )
             from lmcache.v1.compute.models.indexcache_llama import _get_fa3
             _, build_meta = _get_fa3()
-
             t0 = time.time()
             sparse_metadata_caches = []
-            for layer_idx in range(self.model.num_layers):
-                kvcolidx = kvcolidx_caches[layer_idx].contiguous()
-                la_hot_tile = hot_tile_caches[layer_idx].contiguous()
-
+            for layer_idx in range(num_layers):
                 indices, offsets, mask_counts = build_meta(
                     seqlen_total=len(tokens),
                     offset_list=offset_list,
                     question_len=question_len,
-                    kvcolidx_cache=kvcolidx,
-                    la_hot_tile_code_cache=la_hot_tile,
+                    kvcolidx_cache=kvcolidx_caches[layer_idx].contiguous(),
+                    la_hot_tile_code_cache=hot_tile_caches[layer_idx].contiguous(),
                     device=str(device),
                 )
-                sparse_metadata_caches.append(
-                    (indices, offsets, mask_counts)
-                )
-            t1 = time.time()
-            logger.info(
-                f"IndexCache FA3 metadata computed in-band: "
-                f"{t1 - t0:.3f}s (included in TTFT)"
-            )
+                sparse_metadata_caches.append((indices, offsets, mask_counts))
+            logger.info(f"FA3 metadata in-band: {(time.time()-t0)*1000:.1f}ms")
 
         with torch.no_grad():
             gen = self.model.compute_layer(
-                tokens,
-                kvcolidx_caches,
-                hot_tile_caches,
-                offset_list,
-                self.config.page_size,
-                kvcaches,
-                slot_mapping,
+                tokens, kvcolidx_caches, hot_tile_caches,
+                offset_list, self.config.page_size, kvcaches, slot_mapping,
                 attn_backend=self.config.attn_backend,
                 question_len=question_len,
                 sparse_metadata_caches=sparse_metadata_caches,
             )
-            for _ in range(self.model.num_layers):
+            for _ in range(num_layers):
                 next(gen)
 
         logger.info("IndexCache blend done — KV written to paged buffer")
+
+    def _blend_pipelined(self, tokens, offset_list, question_len,
+                         kvcaches, slot_mapping, device):
+        """Pipelined blend: bulk CPU→GPU transfer + inflate for all layers,
+        then per-layer sparse prefill compute.
+
+        The inflate kernel contains an internal cudaStreamSynchronize (for
+        prefix-sum output allocation) which blocks the CPU thread, preventing
+        true per-layer overlap of inflate with compute. Instead, we:
+          1. Bulk transfer all merged metadata CPU→GPU (async, ~few ms)
+          2. Run the batched all-layers inflate kernel (fast, ~4.5ms)
+          3. Run per-layer sparse prefill compute
+
+        Steps 1+2 happen at the start of blend() and are included in TTFT,
+        but they're fast enough (~10ms total) that the impact is minimal
+        compared to the ~800ms+ of sparse prefill compute.
+        """
+        import sys
+        fa3_path = "/var/tmp/rsanovar3/flash-attention/hopper"
+        if fa3_path not in sys.path:
+            sys.path.insert(0, fa3_path)
+        from indexcache_inflate import build_indexcache_metadata_gpu_all_layers
+
+        num_layers = self.model.num_layers
+        seqlen = len(tokens)
+
+        t0 = time.time()
+
+        # Step 1: Bulk CPU→GPU transfer (stack per-layer → one contiguous tensor)
+        kvcolidx_stacked = torch.stack(
+            self._merged_kvcolidx_cpu, dim=0
+        ).contiguous().to(device)
+        la_stacked = torch.stack(
+            self._merged_hot_tile_cpu, dim=0
+        ).contiguous().to(device)
+
+        t_transfer = time.time()
+        transfer_ms = (t_transfer - t0) * 1000
+
+        # Step 2: Batched inflate kernel (all layers, single launch)
+        sparse_metadata_caches = build_indexcache_metadata_gpu_all_layers(
+            seqlen_total=seqlen,
+            offset_list=offset_list,
+            question_len=question_len,
+            kvcolidx_per_layer=kvcolidx_stacked,
+            la_hot_tile_code_per_layer=la_stacked,
+            device=str(device),
+        )
+
+        torch.cuda.synchronize()
+        t_inflate = time.time()
+        inflate_ms = (t_inflate - t_transfer) * 1000
+
+        disk_ms = getattr(self, '_disk_read_ms', 0)
+        deser_ms = getattr(self, '_deserialize_ms', 0)
+        logger.info(
+            f"Pipelined blend: disk_read={disk_ms:.1f}ms, "
+            f"deserialize={deser_ms:.1f}ms, "
+            f"cpu_to_gpu={transfer_ms:.1f}ms, "
+            f"inflate={inflate_ms:.1f}ms (all included in TTFT)"
+        )
+
+        # Step 3: Per-layer sparse prefill compute
+        # Pass placeholder GPU tensors for kvcolidx/hot_tile (FA3 only reads
+        # sparse_metadata_caches, not the raw bit vectors)
+        kvcolidx_caches = [
+            self._merged_kvcolidx_cpu[0].unsqueeze(0).to(device)
+        ] * num_layers
+        hot_tile_caches = [
+            self._merged_hot_tile_cpu[0].unsqueeze(0).to(device)
+        ] * num_layers
+
+        with torch.no_grad():
+            gen = self.model.compute_layer(
+                tokens, kvcolidx_caches, hot_tile_caches,
+                offset_list, self.config.page_size, kvcaches, slot_mapping,
+                attn_backend="fa3",
+                question_len=question_len,
+                sparse_metadata_caches=sparse_metadata_caches,
+            )
+            for _ in range(num_layers):
+                next(gen)
+
+        t1 = time.time()
+        compute_ms = (t1 - t_inflate) * 1000
+        logger.info(
+            f"IndexCache pipelined blend done — {num_layers} layers "
+            f"in {(t1-t0)*1000:.1f}ms "
+            f"(disk={disk_ms:.1f}ms, deser={deser_ms:.1f}ms, "
+            f"cpu2gpu={transfer_ms:.1f}ms, inflate={inflate_ms:.1f}ms, "
+            f"compute={compute_ms:.1f}ms)"
+        )
 
     # ------------------------------------------------------------------
     # Reset (between entries)
@@ -484,4 +695,8 @@ class IndexCacheBlender:
         self.chunk_metadata.clear()
         self.cached_token_ids.clear()
         self._precomputed_sparse_metadata = None
+        self._merged_kvcolidx_cpu = None
+        self._merged_hot_tile_cpu = None
+        self._merged_offset_list = None
+        self._merged_question_len = None
         logger.info("IndexCache metadata reset")

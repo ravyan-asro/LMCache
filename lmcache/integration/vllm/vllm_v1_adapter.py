@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # Standard
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -617,6 +618,13 @@ class LMCacheConnectorV1Impl:
             **kwargs: additional arguments for the save operation.
         """
 
+        # Skip KV writes when LMCACHE_SKIP_SAVE=1 (for benchmarking read-only)
+        if os.environ.get("LMCACHE_SKIP_SAVE", "0") == "1":
+            if not hasattr(self, 'layerwise_storers') or self.current_layer == 0:
+                self.layerwise_storers = []
+            self.current_layer += 1
+            return
+
         # IndexCache: skip per-layer KV store — cache_gen runs in
         # wait_for_save instead (processes all layers at once).
         if getattr(self, "enable_indexcache", False):
@@ -818,7 +826,7 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
-            for layerwise_storer in self.layerwise_storers:
+            for layerwise_storer in getattr(self, 'layerwise_storers', []):
                 next(layerwise_storer)
             return
 
