@@ -18,21 +18,25 @@ def find_important_pages_fast(
 ) -> torch.Tensor:
     """Select important KV pages per head based on attention-score consistency.
 
+    Returns a bit-packed uint8 vector where each bit indicates whether
+    a page is selected (1) or not (0).  Bits are packed MSB-first within
+    each byte, padded to a byte boundary with trailing zeros.
+
     Args:
         attn_scores: (B, H, Q, K) post-softmax attention scores
         page_size: tokens per page
-        num_topk_kvcols: number of page slots in the output (== num_pages)
+        num_topk_kvcols: number of page slots (== num_pages)
         layer_idx: current layer index (for misbehaving-head lookup)
         misbehaving_heads_set: set of (layer, head) tuples
         imp_threshold: per-token importance threshold
         strong_consistency: fraction of queries that must be important
 
     Returns:
-        kvcolidx: (B, H, num_pages) — selected page indices, -1 = padding
+        kvcolidx: (B, H, ceil(num_pages/8)) uint8 — bit-packed page selection
     """
     if num_topk_kvcols == 0:
         B, H = attn_scores.shape[:2]
-        return torch.empty((B, H, 0), dtype=torch.long, device=attn_scores.device)
+        return torch.empty((B, H, 0), dtype=torch.uint8, device=attn_scores.device)
 
     B, H, Q, K = attn_scores.shape
     assert Q == K
@@ -41,24 +45,20 @@ def find_important_pages_fast(
     num_pages = K // page_size
     assert num_topk_kvcols == num_pages
 
-    kvcolidx = torch.full(
-        (B, H, num_pages), -1, device=attn_scores.device, dtype=torch.long
-    )
-
     # Lower-triangular causal mask
     causal_mask = torch.tril(
         torch.ones((1, 1, K, K), device=attn_scores.device, dtype=torch.bool)
     )
 
-    # Combine threshold + causal in one mask (avoids masked_fill copy of attn_scores)
+    # Combine threshold + causal in one mask
     important_mask = (attn_scores >= imp_threshold) & causal_mask
     del causal_mask
 
-    # Per-key (column) importance counts (int16 saves 8x vs default int64)
+    # Per-key (column) importance counts
     num_imp = important_mask.sum(dim=-2, dtype=torch.int16)  # (B, H, K)
     del important_mask
 
-    # Column j in lower-triangular has j+1 non-zero entries — compute analytically
+    # Column j in lower-triangular has j+1 non-zero entries
     total_causal = torch.arange(1, K + 1, device=attn_scores.device, dtype=torch.float)
     consistency = num_imp.float() / total_causal
 
@@ -67,25 +67,42 @@ def find_important_pages_fast(
 
     # Page-level: if any strong token in page → select page
     strong_tokens_pages = strong_tokens.view(B, H, num_pages, page_size).any(dim=-1)
-
-    page_idx = torch.arange(num_pages, device=attn_scores.device)
-    selected_pages = torch.where(
-        strong_tokens_pages, page_idx.view(1, 1, -1), num_pages
-    )
-    sorted_pages = torch.sort(selected_pages, dim=-1).values
-    sorted_pages = torch.where(sorted_pages < num_pages, sorted_pages, -1)
-
-    kvcolidx.copy_(sorted_pages)
+    # (B, H, num_pages) bool
 
     # Misbehaving heads → select ALL pages
     mis = torch.zeros((B, H), dtype=torch.bool, device=attn_scores.device)
     for (layer, head) in misbehaving_heads_set:
         if layer == layer_idx:
             mis[:, head] = True
-    all_pages = torch.arange(num_pages, device=attn_scores.device).expand(B, H, -1)
-    kvcolidx = torch.where(mis.unsqueeze(-1), all_pages, kvcolidx)
+    strong_tokens_pages = strong_tokens_pages | mis.unsqueeze(-1)
+
+    # Bit-pack into uint8, MSB-first, padded to byte boundary
+    kvcolidx = _pack_bits_msb(strong_tokens_pages)  # (B, H, num_bytes) uint8
 
     return kvcolidx
+
+
+def _pack_bits_msb(bools: torch.Tensor) -> torch.Tensor:
+    """Pack a boolean tensor's last dimension into uint8 bytes, MSB-first.
+
+    Args:
+        bools: (..., N) bool tensor
+
+    Returns:
+        packed: (..., ceil(N/8)) uint8 tensor
+    """
+    N = bools.shape[-1]
+    pad = (8 - N % 8) % 8
+    if pad > 0:
+        padded = torch.nn.functional.pad(bools, (0, pad), value=False)
+    else:
+        padded = bools
+    # Reshape last dim into groups of 8
+    shape = padded.shape[:-1] + (padded.shape[-1] // 8, 8)
+    reshaped = padded.view(shape).to(torch.uint8)
+    weights = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1],
+                           dtype=torch.uint8, device=bools.device)
+    return (reshaped * weights).sum(dim=-1, dtype=torch.uint8)
 
 
 def get_hot_tile_code_fast(

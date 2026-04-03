@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # Third Party
+import os
 from torch import nn
 import torch
 
@@ -141,13 +142,19 @@ class LMCLlamaModel(nn.Module):
             max_seq_len=input_ids.shape[0],
         )
 
+        enable_layer_timing = (
+            os.getenv("LMCACHE_ENABLE_LAYER_TIMING", "0").lower() in {"1", "true"}
+        )
+        self._per_layer_forward_ms = {}
+
         for idx, layer in enumerate(
             self.vllm_model.model.layers[
                 self.vllm_model.model.start_layer : self.vllm_model.model.end_layer
             ]
         ):
-            # TODO(Jiayi) The last layer doesn't have to be computed
-            # hidden_states, residual = layer(positions, hidden_states, residual)
+            if enable_layer_timing:
+                _fwd_start = torch.cuda.Event(enable_timing=True)
+                _fwd_start.record()
 
             # Self Attention
             if residual is None:
@@ -217,6 +224,12 @@ class LMCLlamaModel(nn.Module):
                 hidden_states, residual
             )
             hidden_states = getattr(layer, self.mlp_attr)(hidden_states)
+
+            if enable_layer_timing:
+                _fwd_end = torch.cuda.Event(enable_timing=True)
+                _fwd_end.record()
+                _fwd_end.synchronize()
+                self._per_layer_forward_ms[idx] = _fwd_start.elapsed_time(_fwd_end)
 
             yield
 

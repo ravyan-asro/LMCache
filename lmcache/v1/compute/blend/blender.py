@@ -45,6 +45,8 @@ class LMCBlender:
         self.enable_layer_timing = (
             os.getenv("LMCACHE_ENABLE_LAYER_TIMING", "0").lower() in {"1", "true"}
         )
+        # Structured timing data (populated during blend, read by benchmark)
+        self._timing_data = None
 
         self.layerwise_model = infer_model_from_vllm(vllm_model, self)
 
@@ -208,6 +210,9 @@ class LMCBlender:
         layerwise_model_executor = self.layerwise_model.compute_layer(tokens)
         layerwise_retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
 
+        # Per-layer recompute timing storage
+        self._per_layer_recompute_ms = {}
+
         next(layerwise_retriever) # request layer 1 from storage backend
         yield
 
@@ -221,6 +226,7 @@ class LMCBlender:
                 # of layer i-1, so prev layer's CUDA events are safe to read now.
                 prev_end_evt.synchronize()  # wait for end event; no-op if already reached
                 gpu_elapsed_ms = prev_start_evt.elapsed_time(prev_end_evt)
+                self._per_layer_recompute_ms[i - 1] = gpu_elapsed_ms
                 logger.info("GPU recompute layer %d: %.3f ms", i - 1, gpu_elapsed_ms)
 
             if self.enable_layer_timing:
@@ -242,6 +248,7 @@ class LMCBlender:
         if self.enable_layer_timing and prev_start_evt is not None:
             prev_end_evt.synchronize()  # wait for end event; no-op if already reached
             gpu_elapsed_ms = prev_start_evt.elapsed_time(prev_end_evt)
+            self._per_layer_recompute_ms[self.num_layers - 1] = gpu_elapsed_ms
             logger.info("GPU recompute layer %d: %.3f ms", self.num_layers - 1, gpu_elapsed_ms)
 
         self.metadata.clean()
@@ -260,3 +267,49 @@ class LMCBlender:
 
         for i in range(self.num_layers + 2):
             next(layerwise_blender)
+
+        # Collect structured timing data from components
+        if self.enable_layer_timing:
+            self._collect_timing_data()
+
+    def _collect_timing_data(self):
+        """Gather per-layer timing from disk backend, gpu connector, and recompute events."""
+        disk_data = {}
+        h2d_data = {}
+        recompute_data = {}
+
+        # Disk read timing from backend
+        try:
+            storage_mgr = self.cache_engine.storage_manager
+            for backend in storage_mgr.storage_backends.values():
+                if hasattr(backend, "get_layer_timing_data"):
+                    disk_data = backend.get_layer_timing_data()
+                    break
+        except Exception:
+            pass
+
+        # H2D timing from gpu connector
+        try:
+            if hasattr(self.gpu_connector, "get_h2d_layer_timing_data"):
+                h2d_data = self.gpu_connector.get_h2d_layer_timing_data()
+        except Exception:
+            pass
+
+        # Recompute timing from blend_layer (CUDA events around generator next())
+        recompute_data = getattr(self, "_per_layer_recompute_ms", {})
+
+        # Forward timing from inside model (CUDA events around actual kernels)
+        forward_data = {}
+        try:
+            if hasattr(self.layerwise_model, "_per_layer_forward_ms"):
+                forward_data = self.layerwise_model._per_layer_forward_ms
+        except Exception:
+            pass
+
+        self._timing_data = {
+            "num_layers": self.num_layers,
+            "per_layer_disk_read": disk_data,
+            "per_layer_h2d": h2d_data,
+            "per_layer_recompute": recompute_data,
+            "per_layer_forward": forward_data,
+        }

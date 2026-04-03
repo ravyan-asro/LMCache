@@ -106,6 +106,8 @@ class LocalDiskBackend(StorageBackendInterface):
         # Per-layer read stats accumulator (thread-safe)
         self._chunk_stats: list = []  # list of (t_start, t_end, total_bytes)
         self._chunk_stats_lock = threading.Lock()
+        # Structured per-layer timing data for benchmark collection
+        self._layer_timing_data: dict = {}  # layer_id -> {bytes, ms, bw_gbs, num_chunks}
 
     def __str__(self):
         return self.__class__.__name__
@@ -133,6 +135,13 @@ class LocalDiskBackend(StorageBackendInterface):
         total_bytes = sum(s[2] for s in stats)
         elapsed = t_end - t_start
         bw_gbs = total_bytes / elapsed / (1024 ** 3) if elapsed > 0 else float("inf")
+        # Store structured data for benchmark collection
+        self._layer_timing_data[layer_id] = {
+            "bytes": total_bytes,
+            "ms": elapsed * 1000,
+            "bw_gbs": bw_gbs,
+            "num_chunks": len(stats),
+        }
         logger.info(
             "DiskRead layer %d: %.3f MB (%d chunks x%d) in %.3f ms => %.2f GB/s",
             layer_id,
@@ -142,6 +151,12 @@ class LocalDiskBackend(StorageBackendInterface):
             elapsed * 1000,
             bw_gbs,
         )
+
+    def get_layer_timing_data(self):
+        """Return collected per-layer timing data and clear it."""
+        data = dict(self._layer_timing_data)
+        self._layer_timing_data.clear()
+        return data
 
     def _alloc_aligned_buffer(self, size: int) -> tuple[memoryview, ctypes.c_void_p]:
         libc = self._get_libc()

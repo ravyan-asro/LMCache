@@ -346,6 +346,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.enable_layer_timing = (
             os.getenv("LMCACHE_ENABLE_LAYER_TIMING", "0").lower() in {"1", "true"}
         )
+        # Structured per-layer H2D timing data for benchmark collection
+        self._h2d_layer_timing_data: dict = {}  # layer_id -> {bytes, ms, bw_gbs}
 
     def get_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -472,6 +474,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         h2d_prev_bytes / (h2d_ms / 1000) / (1024 ** 3)
                         if h2d_ms > 0 else float("inf")
                     )
+                    # Store structured data for benchmark collection
+                    self._h2d_layer_timing_data[layer_id - 1] = {
+                        "bytes": h2d_prev_bytes,
+                        "ms": h2d_ms,
+                        "bw_gbs": bw_gbs,
+                    }
                     logger.info(
                         "H2D layer %d: %.3f MB in %.3f ms => %.2f GB/s",
                         layer_id - 1, h2d_prev_bytes / (1024 ** 2), h2d_ms, bw_gbs,
@@ -545,6 +553,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         yield
+
+    def get_h2d_layer_timing_data(self):
+        """Return collected per-layer H2D timing data and clear it."""
+        data = dict(self._h2d_layer_timing_data)
+        self._h2d_layer_timing_data.clear()
+        return data
 
     # TODO(Jiayi): Reduce repetitive operations in `batched_to_gpu`
     # and `batched_from_gpu`.

@@ -53,6 +53,12 @@ class IndexCacheBlender:
         self._merged_offset_list = None
         self._merged_question_len = None
 
+        # Structured timing data (populated by _blend_pipelined / blend)
+        self._timing_data = None
+        self.enable_layer_timing = (
+            os.getenv("LMCACHE_ENABLE_LAYER_TIMING", "0").lower() in {"1", "true"}
+        )
+
     # ------------------------------------------------------------------
     # Cache Gen
     # ------------------------------------------------------------------
@@ -145,6 +151,7 @@ class IndexCacheBlender:
 
         self._disk_read_ms = result.get("disk_read_ms", 0)
         self._deserialize_ms = result.get("deserialize_ms", 0)
+        self._disk_file_bytes = result.get("disk_file_bytes", 0)
 
         logger.info(
             f"IndexCache loaded from disk: {result['num_chunks']} chunks, "
@@ -174,32 +181,26 @@ class IndexCacheBlender:
         offset_list = list(
             itertools.accumulate(cl for cl, _, _ in self.chunk_metadata)
         )
-        chunk_num_pages = [cl // page_size for cl, _, _ in self.chunk_metadata]
-        pages_before = [0]
-        for np_ in chunk_num_pages[:-1]:
-            pages_before.append(pages_before[-1] + np_)
 
         kvcolidx_list = []
         hot_tile_list = []
 
         for layer_idx in range(num_layers):
             # Merge kvcolidx across chunks 0..N-2 (exclude last)
-            kv_parts = []
-            for chunk_idx in range(num_chunks - 1):
-                kv = self.chunk_metadata[chunk_idx][1][layer_idx]
-                offset = pages_before[chunk_idx]
-                if offset > 0:
-                    kv = torch.where(kv >= 0, kv + offset, kv)
-                kv_parts.append(kv)
+            # kvcolidx is now uint8 bit-packed — just concatenate bytes
+            # (each chunk is byte-aligned, no offset adjustment needed)
+            kv_parts = [
+                self.chunk_metadata[ci][1][layer_idx]
+                for ci in range(num_chunks - 1)
+            ]
             if kv_parts:
-                merged_kv = torch.cat(kv_parts, dim=-1).squeeze(0)  # (H, total_indices)
+                merged_kv = torch.cat(kv_parts, dim=-1).squeeze(0)  # (H, total_bytes)
             else:
-                B = self.chunk_metadata[0][1][layer_idx].shape[0]
                 H = self.chunk_metadata[0][1][layer_idx].shape[1]
-                merged_kv = torch.empty(H, 0, dtype=torch.long)
+                merged_kv = torch.empty(H, 0, dtype=torch.uint8)
             kvcolidx_list.append(merged_kv.contiguous())
 
-            # Merge hot_tile across all chunks
+            # Merge hot_tile across all chunks (same as before — already byte-aligned)
             ht_parts = [
                 self.chunk_metadata[ci][2][layer_idx]
                 for ci in range(num_chunks)
@@ -267,10 +268,6 @@ class IndexCacheBlender:
         offset_list = list(
             itertools.accumulate(cl for cl, _, _ in self.chunk_metadata)
         )
-        chunk_num_pages = [cl // page_size for cl, _, _ in self.chunk_metadata]
-        pages_before = [0]
-        for np in chunk_num_pages[:-1]:
-            pages_before.append(pages_before[-1] + np)
 
         num_chunks = len(self.chunk_metadata)
         num_layers = self.model.num_layers
@@ -284,49 +281,38 @@ class IndexCacheBlender:
         torch.cuda.synchronize()
         t0 = time.time()
 
-        # --- CPU→GPU transfer: stack per-chunk on CPU, bulk .to(device) ---
-        chunk_kv_gpu = []
-        for chunk_idx in range(num_chunks - 1):
-            meta = self.chunk_metadata[chunk_idx]
-            stacked = torch.stack(meta[1], dim=0)
-            chunk_kv_gpu.append(stacked.to(device))
-
-        chunk_ht_gpu = []
-        for chunk_idx in range(num_chunks):
-            meta = self.chunk_metadata[chunk_idx]
-            stacked = torch.stack(meta[2], dim=0)
-            chunk_ht_gpu.append(stacked.to(device))
-
-        # Merge across chunks per-layer + stack into contiguous tensors
+        # --- Merge on CPU, then bulk transfer to GPU ---
+        # kvcolidx: uint8 bit vectors, just concatenate bytes across chunks 0..N-2
         merged_kv_list = []
         merged_ht_list = []
         for layer_idx in range(num_layers):
-            kvcolidx_list = []
-            for chunk_idx in range(num_chunks - 1):
-                kv = chunk_kv_gpu[chunk_idx][layer_idx]
-                offset = pages_before[chunk_idx]
-                if offset > 0:
-                    kv = torch.where(kv >= 0, kv + offset, kv)
-                kvcolidx_list.append(kv)
-            if kvcolidx_list:
-                merged_kv_list.append(torch.cat(kvcolidx_list, dim=-1))
+            kv_parts = [
+                self.chunk_metadata[ci][1][layer_idx]
+                for ci in range(num_chunks - 1)
+            ]
+            if kv_parts:
+                merged_kv_list.append(
+                    torch.cat(kv_parts, dim=-1).squeeze(0)
+                )
             else:
-                B = self.chunk_metadata[0][1][layer_idx].shape[0]
                 H = self.chunk_metadata[0][1][layer_idx].shape[1]
                 merged_kv_list.append(
-                    torch.empty(B, H, 0, dtype=torch.long, device=device)
+                    torch.empty(H, 0, dtype=torch.uint8)
                 )
-            merged_ht_list.append(torch.cat(
-                [chunk_ht_gpu[ci][layer_idx] for ci in range(num_chunks)],
-                dim=-1,
-            ))
+            ht_parts = [
+                self.chunk_metadata[ci][2][layer_idx]
+                for ci in range(num_chunks)
+            ]
+            merged_ht_list.append(
+                torch.cat(ht_parts, dim=-1).squeeze(0)
+            )
 
         kvcolidx_stacked = torch.stack(
-            [t.squeeze(0) for t in merged_kv_list], dim=0
-        ).contiguous()
+            merged_kv_list, dim=0
+        ).contiguous().to(device)
         la_stacked = torch.stack(
-            [t.squeeze(0) for t in merged_ht_list], dim=0
-        ).contiguous()
+            merged_ht_list, dim=0
+        ).contiguous().to(device)
 
         torch.cuda.synchronize()
         t_transfer = time.time()
@@ -428,21 +414,25 @@ class IndexCacheBlender:
                 active_LA_tiles += total_LA_tiles / num_layers
                 continue
 
-            # CA: vectorized count from kvcolidx
+            # CA: count selected pages from bit-packed kvcolidx
+            # kvcolidx is now (B, H, num_bytes) uint8 bit vector per chunk
+            global_page = 0
             for chunk_idx in range(num_docs - 1):
-                kv = self.chunk_metadata[chunk_idx][1][layer_idx][0]  # (H, num_kvcols)
-                offset = pages_before[chunk_idx]
+                kv = self.chunk_metadata[chunk_idx][1][layer_idx][0]  # (H, num_bytes) uint8
+                n_pages = chunk_num_pages[chunk_idx]
                 for h_idx in range(H):
-                    kv_h = kv[h_idx]
-                    if offset > 0:
-                        kv_h = torch.where(kv_h >= 0, kv_h + offset, kv_h)
-                    kv_valid = kv_h[kv_h >= 0].tolist()
-                    for val in kv_valid:
-                        val = int(val)
-                        if 0 <= val < len(page_to_doc_end):
-                            active_CA_tiles += total_doc_pages - page_to_doc_end[val]
+                    kv_h = kv[h_idx]  # (num_bytes,) uint8
+                    # Unpack bits for this chunk
+                    for page_idx in range(n_pages):
+                        byte_idx = page_idx // 8
+                        bit_offset = 7 - (page_idx % 8)
+                        if (kv_h[byte_idx].item() >> bit_offset) & 1:
+                            gp = pages_before[chunk_idx] + page_idx
+                            if 0 <= gp < len(page_to_doc_end):
+                                active_CA_tiles += total_doc_pages - page_to_doc_end[gp]
+                global_page += n_pages
 
-            # LA: count hot bits (vectorized)
+            # LA: count hot bits (vectorized — same as before)
             hot_tile_list = [meta[2][layer_idx] for meta in self.chunk_metadata]
             layer_code = torch.cat(hot_tile_list, dim=-1)[0]  # (H, total_bytes)
             active_bits = torch.bitwise_and(layer_code.unsqueeze(-1), bitmask) > 0
@@ -620,20 +610,34 @@ class IndexCacheBlender:
         num_layers = self.model.num_layers
         seqlen = len(tokens)
 
-        t0 = time.time()
+        timing = self.enable_layer_timing
 
         # Step 1: Bulk CPU→GPU transfer (stack per-layer → one contiguous tensor)
-        kvcolidx_stacked = torch.stack(
-            self._merged_kvcolidx_cpu, dim=0
-        ).contiguous().to(device)
-        la_stacked = torch.stack(
-            self._merged_hot_tile_cpu, dim=0
-        ).contiguous().to(device)
+        if timing:
+            torch.cuda.synchronize()  # drain GPU queue before timing
+        t0 = time.time()
 
+        kvcolidx_cpu_stacked = torch.stack(
+            self._merged_kvcolidx_cpu, dim=0
+        ).contiguous()
+        la_cpu_stacked = torch.stack(
+            self._merged_hot_tile_cpu, dim=0
+        ).contiguous()
+        metadata_bytes_cpu = (kvcolidx_cpu_stacked.numel() * kvcolidx_cpu_stacked.element_size()
+                              + la_cpu_stacked.numel() * la_cpu_stacked.element_size())
+
+        kvcolidx_stacked = kvcolidx_cpu_stacked.to(device)
+        la_stacked = la_cpu_stacked.to(device)
+
+        if timing:
+            torch.cuda.synchronize()  # wait for async H2D to complete
         t_transfer = time.time()
         transfer_ms = (t_transfer - t0) * 1000
 
         # Step 2: Batched inflate kernel (all layers, single launch)
+        if timing:
+            gmem_before = torch.cuda.memory_allocated(device)
+
         sparse_metadata_caches = build_indexcache_metadata_gpu_all_layers(
             seqlen_total=seqlen,
             offset_list=offset_list,
@@ -643,7 +647,12 @@ class IndexCacheBlender:
             device=str(device),
         )
 
-        torch.cuda.synchronize()
+        torch.cuda.synchronize()  # inflate kernel has internal sync anyway
+        if timing:
+            gmem_after = torch.cuda.memory_allocated(device)
+            inflate_gmem_bytes = gmem_after - gmem_before
+        else:
+            inflate_gmem_bytes = 0
         t_inflate = time.time()
         inflate_ms = (t_inflate - t_transfer) * 1000
 
@@ -653,7 +662,9 @@ class IndexCacheBlender:
             f"Pipelined blend: disk_read={disk_ms:.1f}ms, "
             f"deserialize={deser_ms:.1f}ms, "
             f"cpu_to_gpu={transfer_ms:.1f}ms, "
-            f"inflate={inflate_ms:.1f}ms (all included in TTFT)"
+            f"inflate={inflate_ms:.1f}ms"
+            + (f", inflate_gmem={inflate_gmem_bytes / (1024**2):.1f}MB" if timing else "")
+            + " (all included in TTFT)"
         )
 
         # Step 3: Per-layer sparse prefill compute
@@ -666,6 +677,7 @@ class IndexCacheBlender:
             self._merged_hot_tile_cpu[0].unsqueeze(0).to(device)
         ] * num_layers
 
+        per_layer_compute_ms = []
         with torch.no_grad():
             gen = self.model.compute_layer(
                 tokens, kvcolidx_caches, hot_tile_caches,
@@ -674,18 +686,60 @@ class IndexCacheBlender:
                 question_len=question_len,
                 sparse_metadata_caches=sparse_metadata_caches,
             )
-            for _ in range(num_layers):
-                next(gen)
+            if timing:
+                for layer_idx in range(num_layers):
+                    torch.cuda.synchronize()
+                    t_layer_start = time.time()
+                    next(gen)
+                    torch.cuda.synchronize()
+                    t_layer_end = time.time()
+                    per_layer_compute_ms.append((t_layer_end - t_layer_start) * 1000)
+            else:
+                for _ in range(num_layers):
+                    next(gen)
 
         t1 = time.time()
         compute_ms = (t1 - t_inflate) * 1000
-        logger.info(
-            f"IndexCache pipelined blend done — {num_layers} layers "
-            f"in {(t1-t0)*1000:.1f}ms "
-            f"(disk={disk_ms:.1f}ms, deser={deser_ms:.1f}ms, "
-            f"cpu2gpu={transfer_ms:.1f}ms, inflate={inflate_ms:.1f}ms, "
-            f"compute={compute_ms:.1f}ms)"
-        )
+
+        if timing:
+            disk_file_bytes = getattr(self, '_disk_file_bytes', 0)
+            disk_bw_gbs = (
+                disk_file_bytes / (disk_ms / 1000) / (1024 ** 3)
+                if disk_ms > 0 else float("inf")
+            )
+            transfer_bw_gbs = (
+                metadata_bytes_cpu / (transfer_ms / 1000) / (1024 ** 3)
+                if transfer_ms > 0 else float("inf")
+            )
+            self._timing_data = {
+                "disk_read_ms": disk_ms,
+                "disk_file_bytes": disk_file_bytes,
+                "disk_bw_gbs": disk_bw_gbs,
+                "deserialize_ms": deser_ms,
+                "cpu_to_gpu_ms": transfer_ms,
+                "cpu_to_gpu_bytes": metadata_bytes_cpu,
+                "cpu_to_gpu_bw_gbs": transfer_bw_gbs,
+                "inflate_ms": inflate_ms,
+                "inflate_gmem_bytes": inflate_gmem_bytes,
+                "inflate_gmem_mb": inflate_gmem_bytes / (1024 ** 2),
+                "compute_total_ms": compute_ms,
+                "per_layer_compute_ms": per_layer_compute_ms,
+                "num_layers": num_layers,
+                "total_ms": (t1 - t0) * 1000,
+            }
+            logger.info(
+                f"IndexCache pipelined blend done — {num_layers} layers "
+                f"in {(t1-t0)*1000:.1f}ms "
+                f"(disk={disk_ms:.1f}ms, deser={deser_ms:.1f}ms, "
+                f"cpu2gpu={transfer_ms:.1f}ms [{transfer_bw_gbs:.2f} GB/s], "
+                f"inflate={inflate_ms:.1f}ms [{inflate_gmem_bytes/(1024**2):.1f}MB GMEM], "
+                f"compute={compute_ms:.1f}ms)"
+            )
+        else:
+            logger.info(
+                f"IndexCache pipelined blend done — {num_layers} layers "
+                f"in {(t1-t0)*1000:.1f}ms"
+            )
 
     # ------------------------------------------------------------------
     # Reset (between entries)
@@ -699,4 +753,5 @@ class IndexCacheBlender:
         self._merged_hot_tile_cpu = None
         self._merged_offset_list = None
         self._merged_question_len = None
+        self._timing_data = None
         logger.info("IndexCache metadata reset")

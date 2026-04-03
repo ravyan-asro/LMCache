@@ -87,31 +87,22 @@ class IndexCacheDiskBackend:
         buf.write(struct.pack('<I', len(token_arr)))
         buf.write(token_arr.tobytes())
 
-        # Per-layer metadata: kvcolidx + hot_tile for each layer
-        # Store sizes first, then data, so we can seek per-layer on read
+        # Per-layer metadata: kvcolidx (uint8 bit vector) + hot_tile for each layer
         layer_data = []
         for layer_idx in range(num_layers):
-            # Merge kvcolidx across chunks (exclude last chunk for CA)
-            kv_parts = []
-            pages_before = [0]
-            page_size = chunk_metadata[0][0]  # approximate, not critical
-            for ci in range(num_chunks):
-                cl = chunk_metadata[ci][0]
-                if ci > 0:
-                    pages_before.append(pages_before[-1] + chunk_metadata[ci-1][0] // 128)
-            for ci in range(num_chunks - 1):
-                kv = chunk_metadata[ci][1][layer_idx]
-                offset = pages_before[ci]
-                if offset > 0:
-                    kv = torch.where(kv >= 0, kv + offset, kv)
-                kv_parts.append(kv)
+            # Merge kvcolidx across chunks 0..N-2 (exclude last)
+            # kvcolidx is uint8 bit-packed — just concatenate bytes
+            kv_parts = [
+                chunk_metadata[ci][1][layer_idx]
+                for ci in range(num_chunks - 1)
+            ]
             if kv_parts:
                 merged_kv = torch.cat(kv_parts, dim=-1).squeeze(0).contiguous()
             else:
                 H = chunk_metadata[0][1][layer_idx].shape[1]
-                merged_kv = torch.empty(H, 0, dtype=torch.long)
+                merged_kv = torch.empty(H, 0, dtype=torch.uint8)
 
-            # Merge hot_tile across all chunks
+            # Merge hot_tile across all chunks (already byte-aligned)
             ht_parts = [chunk_metadata[ci][2][layer_idx] for ci in range(num_chunks)]
             merged_ht = torch.cat(ht_parts, dim=-1).squeeze(0).contiguous()
 
@@ -119,8 +110,8 @@ class IndexCacheDiskBackend:
             ht_bytes = merged_ht.numpy().tobytes()
 
             # Store shape info + data
-            kv_shape = merged_kv.shape  # (H, num_indices)
-            ht_shape = merged_ht.shape  # (H, num_bytes)
+            kv_shape = merged_kv.shape  # (H, num_bytes) uint8
+            ht_shape = merged_ht.shape  # (H, num_bytes) uint8
             layer_data.append((kv_shape, kv_bytes, ht_shape, ht_bytes))
 
         # Write layer index (shapes + sizes for seeking)
@@ -131,8 +122,6 @@ class IndexCacheDiskBackend:
             buf.write(struct.pack('<II', len(kv_bytes), len(ht_bytes)))
             buf.write(kv_bytes)
             buf.write(ht_bytes)
-
-        raw = buf.getvalue()
 
         raw = buf.getvalue()
 
@@ -199,10 +188,10 @@ class IndexCacheDiskBackend:
             ht_raw = buf.read(ht_nbytes)
 
             if kv_cols > 0:
-                kv_np = np.frombuffer(kv_raw, dtype=np.int64).reshape(kv_h, kv_cols)
+                kv_np = np.frombuffer(kv_raw, dtype=np.uint8).reshape(kv_h, kv_cols)
                 kv_tensor = torch.from_numpy(kv_np.copy()).contiguous()
             else:
-                kv_tensor = torch.empty(kv_h, 0, dtype=torch.long)
+                kv_tensor = torch.empty(kv_h, 0, dtype=torch.uint8)
 
             if ht_bytes_dim > 0:
                 ht_np = np.frombuffer(ht_raw, dtype=np.uint8).reshape(ht_h, ht_bytes_dim)
@@ -229,6 +218,7 @@ class IndexCacheDiskBackend:
             "cached_token_ids": cached_token_ids,
             "num_layers": num_layers,
             "num_chunks": num_chunks,
+            "disk_file_bytes": file_size,
             "disk_read_ms": disk_ms,
             "deserialize_ms": deser_ms,
         }
