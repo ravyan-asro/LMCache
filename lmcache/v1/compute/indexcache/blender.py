@@ -741,6 +741,18 @@ class IndexCacheBlender:
                 f"in {(t1-t0)*1000:.1f}ms"
             )
 
+        # Compute and save sparsity + size stats (rank 0 only for TP>1)
+        try:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+        except Exception:
+            rank = 0
+        if rank == 0:
+            try:
+                self._compute_and_save_stats(len(tokens), question_len)
+            except Exception as e:
+                logger.warning(f"Failed to save IndexCache stats: {e}")
+
     # ------------------------------------------------------------------
     # Reset (between entries)
     # ------------------------------------------------------------------
