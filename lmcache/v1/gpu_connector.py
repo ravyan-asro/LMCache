@@ -348,6 +348,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         )
         # Structured per-layer H2D timing data for benchmark collection
         self._h2d_layer_timing_data: dict = {}  # layer_id -> {bytes, ms, bw_gbs}
+        # Structured per-layer RoPE timing data for benchmark collection
+        self._rope_layer_timing_data: dict = {}  # layer_id -> ms
 
     def get_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -445,6 +447,9 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         h2d_prev_start_evt = None
         h2d_prev_end_evt = None
         h2d_prev_bytes = 0
+        # Pending RoPE events keyed by layer_id; read after the *next* cuda
+        # synchronize (the one at the top of the following iteration).
+        rope_pending: dict = {}  # layer_id -> (start_evt, end_evt)
         for layer_id in range(self.num_layers + 2):
             if layer_id > 1:
                 nvtx.range_push(f"KVTransfer_L{layer_id - 2}")
@@ -466,6 +471,17 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 nvtx.range_push(f"Sync_L{layer_id}")
                 torch.cuda.synchronize()
                 nvtx.range_pop()
+
+                # Drain any RoPE events pending from the previous iteration;
+                # they are guaranteed to have completed after the sync above.
+                if self.enable_layer_timing and rope_pending:
+                    for rl_id, (s_evt, e_evt) in rope_pending.items():
+                        rope_ms = s_evt.elapsed_time(e_evt)
+                        self._rope_layer_timing_data[rl_id] = rope_ms
+                        logger.info(
+                            "RoPE layer %d: %.3f ms", rl_id, rope_ms,
+                        )
+                    rope_pending.clear()
 
                 if self.enable_layer_timing and h2d_prev_start_evt is not None:
                     # synchronize() above guarantees load_stream events are done
@@ -495,11 +511,18 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     assert compute_gpu_buffer_obj.tensor is not None
 
                     nvtx.range_push(f"RoPE_L{layer_id - 1}")
+                    if self.enable_layer_timing:
+                        rope_start_evt = torch.cuda.Event(enable_timing=True)
+                        rope_end_evt = torch.cuda.Event(enable_timing=True)
+                        rope_start_evt.record()
                     compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
                         old_positions_full,
                         new_positions_full,
                         compute_gpu_buffer_obj.tensor[0],
                     )
+                    if self.enable_layer_timing:
+                        rope_end_evt.record()
+                        rope_pending[layer_id - 1] = (rope_start_evt, rope_end_evt)
                     nvtx.range_pop()
 
                 self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
@@ -543,6 +566,16 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             elif layer_id == self.num_layers:
                 yield
 
+        # Drain any remaining RoPE events (e.g. for the last layer, which
+        # has no subsequent cuda.synchronize() in the loop).
+        if self.enable_layer_timing and rope_pending:
+            torch.cuda.synchronize()
+            for rl_id, (s_evt, e_evt) in rope_pending.items():
+                rope_ms = s_evt.elapsed_time(e_evt)
+                self._rope_layer_timing_data[rl_id] = rope_ms
+                logger.info("RoPE layer %d: %.3f ms", rl_id, rope_ms)
+            rope_pending.clear()
+
         # free the buffer memory
         load_gpu_buffer_obj.ref_count_down()
         compute_gpu_buffer_obj.ref_count_down()
@@ -558,6 +591,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         """Return collected per-layer H2D timing data and clear it."""
         data = dict(self._h2d_layer_timing_data)
         self._h2d_layer_timing_data.clear()
+        return data
+
+    def get_rope_layer_timing_data(self):
+        """Return collected per-layer RoPE timing data and clear it."""
+        data = dict(self._rope_layer_timing_data)
+        self._rope_layer_timing_data.clear()
         return data
 
     # TODO(Jiayi): Reduce repetitive operations in `batched_to_gpu`

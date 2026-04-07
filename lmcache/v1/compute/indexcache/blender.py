@@ -359,9 +359,12 @@ class IndexCacheBlender:
         num_layers = self.model.num_layers
 
         # --- Block sparsity from FA3 sparse metadata ---
+        # In pipelined path, _precomputed_sparse_metadata is None (inflated
+        # directly inside blend()), so block_sparsity is not available.
         total_sparse_blocks = 0
-        for indices, offsets, mask_counts in self._precomputed_sparse_metadata:
-            total_sparse_blocks += indices.numel()
+        if self._precomputed_sparse_metadata is not None:
+            for indices, offsets, mask_counts in self._precomputed_sparse_metadata:
+                total_sparse_blocks += indices.numel()
 
         num_heads_q = self.model.num_heads
         num_m_blocks = math.ceil(total_seqlen / 128)  # kBlockM=128

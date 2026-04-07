@@ -276,6 +276,7 @@ class LMCBlender:
         """Gather per-layer timing from disk backend, gpu connector, and recompute events."""
         disk_data = {}
         h2d_data = {}
+        rope_data = {}
         recompute_data = {}
 
         # Disk read timing from backend
@@ -295,8 +296,26 @@ class LMCBlender:
         except Exception:
             pass
 
-        # Recompute timing from blend_layer (CUDA events around generator next())
-        recompute_data = getattr(self, "_per_layer_recompute_ms", {})
+        # Per-layer RoPE timing from gpu connector (fused_rotary_emb over
+        # all context tokens that runs on the compute stream before the
+        # layer's attention+MLP recompute).
+        try:
+            if hasattr(self.gpu_connector, "get_rope_layer_timing_data"):
+                rope_data = self.gpu_connector.get_rope_layer_timing_data()
+        except Exception:
+            pass
+
+        # Raw recompute timing from blend_layer (CUDA events around generator next())
+        raw_recompute = getattr(self, "_per_layer_recompute_ms", {})
+
+        # Fold RoPE into per_layer_recompute so the "per-layer compute" bar in
+        # timing plots reflects all compute-stream work (RoPE + attention + MLP),
+        # not just the attention/MLP part. RoPE is measured independently for
+        # debug visibility via per_layer_rope.
+        recompute_data = {}
+        all_layers = set(raw_recompute.keys()) | set(rope_data.keys())
+        for li in all_layers:
+            recompute_data[li] = raw_recompute.get(li, 0.0) + rope_data.get(li, 0.0)
 
         # Forward timing from inside model (CUDA events around actual kernels)
         forward_data = {}
@@ -310,6 +329,34 @@ class LMCBlender:
             "num_layers": self.num_layers,
             "per_layer_disk_read": disk_data,
             "per_layer_h2d": h2d_data,
-            "per_layer_recompute": recompute_data,
+            "per_layer_recompute": recompute_data,       # includes RoPE
+            "per_layer_recompute_raw": raw_recompute,    # attention/MLP only
+            "per_layer_rope": rope_data,
             "per_layer_forward": forward_data,
         }
+
+        # For TP>1: save timing data to a temp file so the main process
+        # (which can't access worker-side blender objects) can read it.
+        try:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+        except Exception:
+            rank = 0
+        if rank == 0:
+            import json as _json
+            timing_path = "/tmp/blend_timing.json"
+            try:
+                # Convert any non-serializable keys (int layer ids) to strings
+                serializable = {}
+                for k, v in self._timing_data.items():
+                    if isinstance(v, dict):
+                        serializable[k] = {str(kk): vv for kk, vv in v.items()}
+                    else:
+                        serializable[k] = v
+                with open(timing_path, "w") as f:
+                    _json.dump(serializable, f)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Failed to save blend timing to {timing_path}: {e}"
+                )
