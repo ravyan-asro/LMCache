@@ -223,11 +223,16 @@ def get_fused_rope(
     fused_rope = FusedRope(rope, is_neox_style,
                            head_size=head_size, rotary_dim=rotary_dim)
 
-    correct = validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size)
-    if not correct:
-        logger.error(
-            "Fused/reverse rotary encoding is not correct! Will disable blending!"
-        )
-        return None
+    # BasicReverseRope assumes full-head shuffle and fails validation for
+    # partial rotary (e.g. MiniMax: rotary_dim=64, head_dim=128). The fused
+    # kernel itself handles partial rotary correctly via cos_sin_cache sizing,
+    # so skip reverse-rope-based validation in the partial case.
+    if rotary_dim == head_size:
+        correct = validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size)
+        if not correct:
+            logger.error(
+                "Fused/reverse rotary encoding is not correct! Will disable blending!"
+            )
+            return None
 
     return fused_rope

@@ -95,6 +95,7 @@ class LMCLlamaModel(nn.Module):
         rotary_dim = int(rotary_dim) if rotary_dim != head_dim else head_dim
 
         rope_scaling = getattr(vllm_model.config, 'rope_scaling', None)
+        partial_rotary_factor = rotary_dim / head_dim
         self.fused_rotary_emb = get_fused_rope(
             head_dim,
             rotary_dim=rotary_dim,
@@ -103,6 +104,7 @@ class LMCLlamaModel(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
             dtype=dtype,
+            partial_rotary_factor=partial_rotary_factor,
         )
 
     def compute_layer(
