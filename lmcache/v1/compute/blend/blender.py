@@ -70,6 +70,9 @@ class LMCBlender:
             int(x) for x in os.getenv("LMCACHE_INFOFLOW_LAYERS", "22,23,24,25").split(",")
         ]
         self.infoflow_ratio = float(os.getenv("BLEND_RECOMPUTE_RATIO", "0.15"))
+        self.infoflow_reorder = (
+            os.getenv("LMCACHE_INFOFLOW_REORDER", "0").lower() in {"1", "true"}
+        )
         self._if_phase = None  # None | "score" | "recompute"
         self.infoflow_stats = None
 
@@ -303,70 +306,110 @@ class LMCBlender:
 
     # ------------------------------------------------------------------
     # InfoFlow KV (Teng et al., ICML'26; arXiv 2603.05353, Sec 4 + App F;
-    # official code github.com/tx467/InfoFlow-KV)
+    # official code github.com/tx467/InfoFlow-KV,
+    # llm/scripts/inference_with_recompute_kv.py)
     # ------------------------------------------------------------------
     # The blend range is the cached context only; vLLM computes the query
     # afterwards from the paged cache.  The adapter passes `query_tokens`.
-    # Pass 1 ("score"): layer-wise retrieve of the context KV (re-rotated to
-    #   GLOBAL positions by the GPU connector and written to vLLM's paged
-    #   cache) while only the query tokens are forwarded over it.  The query is
-    #   a suffix, so FlashAttention's bottom-right causal mask is exact.  The
-    #   "norm" score is accumulated at the scoring layers.
-    # Pass 2 ("recompute"): the top-k context tokens (first chunk excluded,
-    #   k = int(context_len * ratio), as in the official select_positions) are
-    #   recomputed at ALL layers against the stale KV read back from the paged
-    #   cache, with a position-aware causal mask (official recomputer uses
-    #   query_positions >= key_positions), and written back.
-    #   Disk I/O happens once, in pass 1.
+    #
+    # Without reorder (official make_1_layer_recompute_fn):
+    #   stage 1 scores at GLOBAL positions; top-k excludes the first chunk.
+    # With reorder, LMCACHE_INFOFLOW_REORDER=1 (official make_double_guided_fn):
+    #   stage 1 scores at chunk-LOCAL positions (extract_without_RoPE_correction);
+    #   chunks are reordered by their share of selected tokens (ascending, so the
+    #   most informative sit next to the query) and their KV is rebased to the
+    #   new positions (reorder_and_rebase_kv); stage 2 re-scores at GLOBAL
+    #   positions; neither stage excludes the first chunk.  Unit 0 (whatever the
+    #   first stored chunk is) stays in front: the official code pins only its
+    #   1-token prefix, so the driver can make the template its own unit 0.
+    # Both: k = int(context_len * ratio); the selected tokens plus any tokens
+    # not covered by a stored chunk (the "# #" separators) are recomputed at ALL
+    # layers with a position-aware causal mask.  Everything stays in HBM after
+    # the single disk read; all stages are inside the request (TTFT), as in the
+    # official code (start_time is taken before extraction).
     def _infoflow_blend(self, tokens, mask=None, query_tokens=None, **kwargs):
         if query_tokens is None or query_tokens.numel() == 0:
             raise ValueError("InfoFlow needs the query tokens (see vllm_v1_adapter)")
         device = torch.device("cuda")
+        query_tokens = query_tokens.to(tokens.device)
         ctx_len = tokens.shape[0]
-        all_tokens = torch.cat([tokens, query_tokens.to(tokens.device)])
         self._if_ctx_len = ctx_len
         self._if_kvcaches = kwargs["kvcaches"]
         self._if_slot_mapping = kwargs["slot_mapping"].to(device)
+        budget = int(ctx_len * self.infoflow_ratio)
+        events = {}
+
+        def mark(name):
+            events[name] = torch.cuda.Event(enable_timing=True)
+            events[name].record()
+
+        mark("start")
+        # Stage 1: layer-wise retrieve (context) interleaved with a query-only
+        # forward, mirroring blend_layer().
+        self._if_phase = "score_retrieve"
+        self._if_local_pos = None
         self._if_scores = torch.zeros(ctx_len, dtype=torch.float32, device=device)
-
-        start_evt = torch.cuda.Event(enable_timing=True)
-        mid_evt = torch.cuda.Event(enable_timing=True)
-        end_evt = torch.cuda.Event(enable_timing=True)
-        start_evt.record()
-
-        # Pass 1: interleave layer-wise retrieval (context) with the
-        # query-only forward, mirroring blend_layer().
-        self._if_phase = "score"
-        executor = self.layerwise_model.compute_layer(all_tokens)
+        executor = self.layerwise_model.compute_layer(torch.cat([tokens, query_tokens]))
         retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
         next(retriever)
+        if self.infoflow_reorder:
+            self._if_local_pos = self._chunk_local_positions(ctx_len, device)
         for _ in range(self.num_layers):
             next(retriever)
             next(executor)
         next(retriever)
         self.metadata.clean()
+        mark("stage1")
 
-        first_end = self.gpu_connector.chunk_ends[0]
-        candidates = torch.arange(first_end, ctx_len, device=device)
-        budget = min(int(ctx_len * self.infoflow_ratio), candidates.numel())
-        top = candidates[torch.topk(self._if_scores[candidates], k=budget).indices]
-        self._if_imp, _ = torch.sort(top)
-        mid_evt.record()
+        starts = list(self.gpu_connector.chunk_starts)
+        ends = list(self.gpu_connector.chunk_ends)
+        covered = torch.zeros(ctx_len, dtype=torch.bool, device=device)
+        for s_, e_ in zip(starts, ends):
+            covered[s_:e_] = True
+        gaps = torch.nonzero(~covered).flatten()
 
-        # Pass 2: recompute the selected context tokens at every layer.
+        chunk_order = None
+        if self.infoflow_reorder:
+            sel = torch.topk(self._if_scores, k=budget).indices
+            perm, chunk_order = self._infoflow_reorder_perm(sel, starts, ends, ctx_len, device)
+            self._infoflow_permute_paged(perm)
+            inv = torch.empty_like(perm)
+            inv[perm] = torch.arange(ctx_len, device=device)
+            gaps = inv[gaps]
+            tokens = tokens[perm.to(tokens.device)]
+            mark("reorder")
+            # Stage 2: GLOBAL positions on the reordered layout, KV from HBM.
+            self._if_phase = "score_paged"
+            self._if_scores = torch.zeros(ctx_len, dtype=torch.float32, device=device)
+            for _ in self.layerwise_model.compute_layer(torch.cat([tokens, query_tokens])):
+                pass
+            self.metadata.clean()
+            sel = torch.topk(self._if_scores, k=budget).indices
+            mark("stage2")
+        else:
+            candidates = torch.arange(ends[0], ctx_len, device=device)
+            k = min(budget, candidates.numel())
+            sel = candidates[torch.topk(self._if_scores[candidates], k=k).indices]
+
+        self._if_imp = torch.unique(torch.cat([sel, gaps]))  # sorted
         self._if_phase = "recompute"
         for _ in self.layerwise_model.compute_layer(tokens):
             pass
-        end_evt.record()
-        end_evt.synchronize()
+        mark("end")
+        events["end"].synchronize()
 
+        names = list(events)
         self.infoflow_stats = {
             "context_tokens": ctx_len,
             "query_tokens": int(query_tokens.numel()),
-            "first_chunk_tokens": first_end,
-            "recomputed_context_tokens": budget,
-            "score_pass_ms": start_evt.elapsed_time(mid_evt),
-            "recompute_pass_ms": mid_evt.elapsed_time(end_evt),
+            "num_chunks": len(starts),
+            "first_chunk_tokens": ends[0],
+            "selected_tokens": int(sel.numel()),
+            "gap_tokens": int(gaps.numel()),
+            "recomputed_context_tokens": int(self._if_imp.numel()),
+            "reorder": bool(self.infoflow_reorder),
+            "chunk_order": chunk_order,
+            **{f"{b}_ms": events[a].elapsed_time(events[b]) for a, b in zip(names, names[1:])},
         }
         logger.info("InfoFlow blend: %s", self.infoflow_stats)
         stats_path = os.getenv("LMCACHE_INFOFLOW_STATS_PATH")
@@ -378,6 +421,43 @@ class LMCBlender:
         self.metadata.clean()
         self._if_phase = None
         self._if_scores = None
+        self._if_local_pos = None
+
+    def _chunk_local_positions(self, ctx_len, device):
+        """Position of every context token inside its stored chunk (HL geometry)."""
+        local = torch.arange(ctx_len, device=device)
+        for s_, e_ in zip(self.gpu_connector.chunk_starts, self.gpu_connector.chunk_ends):
+            local[s_:e_] -= s_
+        return local
+
+    def _infoflow_reorder_perm(self, sel, starts, ends, ctx_len, device):
+        """Permutation of context tokens after reordering stored chunks.
+
+        Each unit is a stored chunk plus any trailing uncovered tokens
+        (separator); a leading uncovered region joins unit 0.  Unit 0 stays
+        first; the rest are sorted by (ratio, index) ascending, as in the
+        official reorder_and_rebase_kv(put_higher_ratio_to_tail=True).
+        """
+        n = len(starts)
+        bounds = [0] + list(starts[1:]) + [ctx_len]
+        counts = torch.bincount(
+            torch.bucketize(sel, torch.tensor(ends, device=device), right=True),
+            minlength=n + 1,
+        )[:n].tolist()
+        ratios = [counts[i] / max(1, ends[i] - starts[i]) for i in range(n)]
+        order = [0] + sorted(range(1, n), key=lambda i: (ratios[i], i))
+        perm = torch.cat([torch.arange(bounds[i], bounds[i + 1], device=device) for i in order])
+        return perm, order
+
+    def _infoflow_permute_paged(self, perm):
+        """Reorder the context KV in the paged cache and rebase key RoPE."""
+        ctx_len = perm.numel()
+        new_pos = torch.arange(ctx_len, device=perm.device)
+        rope = self.layerwise_model.fused_rotary_emb
+        for layer_id in range(self.num_layers):
+            k, v = self._paged_get_kv(layer_id)
+            k = rope(perm, new_pos, k[perm].contiguous())
+            self._paged_put_kv(layer_id, new_pos, k, v[perm].contiguous())
 
     def _infoflow_process_qkv(
         self, q, k, v, residual, layer_id, attn_output, attn_metadata
@@ -391,9 +471,10 @@ class LMCBlender:
         attn_layer = self.layerwise_model.vllm_model.model.layers[layer_id].self_attn
         q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
         ctx_len = self._if_ctx_len
+        scoring = self._if_phase in ("score_retrieve", "score_paged")
 
         if layer_id == 0:
-            if self._if_phase == "score":
+            if scoring:
                 idx = torch.arange(ctx_len, q.shape[0], device=q.device)
             else:
                 idx = self._if_imp
@@ -408,11 +489,21 @@ class LMCBlender:
                 [0, num], dtype=torch.int32, device=q.device
             )
 
-        if self._if_phase == "score":
-            # Context KV from the retrieval buffer, query KV appended (suffix).
-            old_k, old_v = self.gpu_connector.get_kv(layer_id)
-            k_all = torch.cat([old_k[:ctx_len], k])
-            v_all = torch.cat([old_v[:ctx_len], v])
+        if scoring:
+            # Context KV (retrieval buffer or HBM paged cache), query KV appended
+            # as a suffix, so FA's bottom-right causal mask is exact.
+            if self._if_phase == "score_retrieve":
+                old_k, old_v = self.gpu_connector.get_kv(layer_id)
+                old_k, old_v = old_k[:ctx_len], old_v[:ctx_len]
+                if self._if_local_pos is not None:  # stage 1 of +Reorder: HL geometry
+                    old_k = self.layerwise_model.fused_rotary_emb(
+                        torch.arange(ctx_len, device=q.device), self._if_local_pos,
+                        old_k.contiguous(),
+                    )
+            else:
+                old_k, old_v = self._paged_get_kv(layer_id)
+            k_all = torch.cat([old_k, k])
+            v_all = torch.cat([old_v, v])
             if layer_id in self.infoflow_layers:
                 self._infoflow_accumulate(q, k_all, layer_id)
             return q, k_all, v_all, residual, attn_output, attn_metadata
