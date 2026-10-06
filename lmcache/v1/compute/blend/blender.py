@@ -369,6 +369,12 @@ class LMCBlender:
             "recompute_pass_ms": mid_evt.elapsed_time(end_evt),
         }
         logger.info("InfoFlow blend: %s", self.infoflow_stats)
+        stats_path = os.getenv("LMCACHE_INFOFLOW_STATS_PATH")
+        if stats_path:  # read back by the experiment driver (engine runs in a subprocess)
+            import json
+
+            with open(stats_path, "a") as f:
+                f.write(json.dumps(self.infoflow_stats) + "\n")
         self.metadata.clean()
         self._if_phase = None
         self._if_scores = None
