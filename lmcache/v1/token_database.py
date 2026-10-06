@@ -17,6 +17,8 @@ from typing import Iterable, List, Optional, Tuple, Union
 import abc
 import array
 import hashlib
+import json
+import os
 
 # Third Party
 from transformers import AutoTokenizer
@@ -200,6 +202,13 @@ class SegmentTokenDatabase(TokenDatabase):
         self.sep_tokens = torch.tensor(self.sep_tokens, device="cpu")
         self.sep_len = len(self.sep_tokens)
         self.metadata = metadata
+        # Optional separator-free segmentation: a JSON file {"chunks": [[ids], ...]}
+        # written by the experiment driver before each request.  Chunks are
+        # matched in order at the start of the token sequence; the rest (the
+        # query) is one trailing segment.  Unset -> separator splitting.
+        self.registry_path = os.getenv("LMCACHE_SEGMENT_REGISTRY")
+        self._registry_mtime = None
+        self._registry_chunks = []
 
     def _make_key_by_hash(self, chunk_hash: str):
         return CacheEngineKey(
@@ -220,6 +229,33 @@ class SegmentTokenDatabase(TokenDatabase):
         elif isinstance(tokens, list):
             tokens_bytes = array.array("I", tokens).tobytes()
         return hashlib.sha256(tokens_bytes).hexdigest()
+
+    def _load_registry(self):
+        try:
+            st = os.stat(self.registry_path)
+        except OSError:
+            return []
+        mtime = (st.st_mtime_ns, st.st_size)
+        if mtime != self._registry_mtime:
+            with open(self.registry_path) as f:
+                chunks = json.load(f).get("chunks", [])
+            self._registry_chunks = [torch.tensor(c, dtype=torch.long) for c in chunks]
+            self._registry_mtime = mtime
+        return self._registry_chunks
+
+    def _split_by_registry(self, tokens: torch.Tensor) -> List[torch.Tensor]:
+        """Split `tokens` into the registered chunks (in order) + the rest."""
+        flat = tokens.cpu().long()
+        pos, segments = 0, []
+        for chunk in self._load_registry():
+            n = chunk.numel()
+            if pos + n > flat.numel() or not torch.equal(flat[pos:pos + n], chunk):
+                break
+            segments.append(tokens[pos:pos + n])
+            pos += n
+        if pos < flat.numel():
+            segments.append(tokens[pos:])
+        return segments
 
     def _fast_split_by_subtensor(self, tokens: torch.Tensor) -> Iterable[torch.Tensor]:
         """Match the `sep_tokens` with sliding windows"""
@@ -278,14 +314,17 @@ class SegmentTokenDatabase(TokenDatabase):
             "be less than the length of tokens."
         )
 
-        token_chunks = self._fast_split_by_subtensor(tokens)
+        if self.registry_path:
+            token_chunks, sep_len = self._split_by_registry(tokens), 0
+        else:
+            token_chunks, sep_len = self._fast_split_by_subtensor(tokens), self.sep_len
         start_idx = 0
         for idx, token_chunk in enumerate(token_chunks):
             token_chunk_len = len(token_chunk)
             end_idx = start_idx + token_chunk_len
             if idx > 0:
-                start_idx += self.sep_len
-                end_idx += self.sep_len
+                start_idx += sep_len
+                end_idx += sep_len
                 # end_idx = min(end_idx, len(tokens))
             if start_idx >= num_falses:
                 if make_key:
