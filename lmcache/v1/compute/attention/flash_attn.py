@@ -60,6 +60,25 @@ class LMCFlashAttnBackend(AttentionInterface):
         **kwargs,
     ) -> torch.Tensor:
         # num_actual_tokens = query.shape[0]
+        query_positions = getattr(attn_metadata, "query_positions", None)
+        if query_positions is not None:
+            # Non-contiguous query rows (InfoFlow recompute): each query may
+            # attend only to keys at or before its own position.  FA's
+            # bottom-right causal alignment would be wrong here.
+            import flashinfer
+
+            key_positions = torch.arange(key.shape[0], device=key.device)
+            mask = query_positions[:, None] >= key_positions[None, :]
+            output.copy_(
+                flashinfer.single_prefill_with_kv_cache(
+                    query, key, value,
+                    custom_mask=mask,
+                    causal=False,
+                    kv_layout="NHD",
+                    sm_scale=self.vllm_attn_impl.scale,
+                )
+            )
+            return output
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens

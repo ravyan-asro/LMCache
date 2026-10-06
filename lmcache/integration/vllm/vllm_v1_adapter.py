@@ -533,11 +533,17 @@ class LMCacheConnectorV1Impl:
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
+                    blend_kwargs = {}
+                    if getattr(self.blender, "infoflow_mode", False):
+                        # InfoFlow scores context tokens by the query's
+                        # attention; the query itself is computed by vLLM.
+                        blend_kwargs["query_tokens"] = tokens[lmcache_cached_tokens:]
                     self.blender.blend(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        **blend_kwargs,
                     )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(

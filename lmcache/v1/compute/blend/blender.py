@@ -61,7 +61,28 @@ class LMCBlender:
             os.getenv("LMCACHE_EPIC_TOKENS_PER_CHUNK", "64")
         )
 
-        if self.epic_mode:
+        # InfoFlow KV (ICML'26): select recompute tokens by query->context
+        # attention mass at mid/late layers, then recompute them at all layers.
+        self.infoflow_mode = (
+            os.getenv("LMCACHE_INFOFLOW_MODE", "0").lower() in {"1", "true"}
+        )
+        self.infoflow_layers = [
+            int(x) for x in os.getenv("LMCACHE_INFOFLOW_LAYERS", "22,23,24,25").split(",")
+        ]
+        self.infoflow_ratio = float(os.getenv("BLEND_RECOMPUTE_RATIO", "0.15"))
+        self._if_phase = None  # None | "score" | "recompute"
+        self.infoflow_stats = None
+
+        if self.infoflow_mode:
+            logger.info(
+                "InfoFlow mode enabled: ratio %.3f, scoring layers %s",
+                self.infoflow_ratio,
+                self.infoflow_layers,
+            )
+            self.common_metadata = LMCBlendCommonMetadata(
+                check_layers=[], recomp_ratios=[], thresholds=None
+            )
+        elif self.epic_mode:
             logger.info(
                 "EPIC mode enabled: static %d tokens/chunk recompute, "
                 "partial recompute in ALL layers (including 0 and 1)",
@@ -114,6 +135,10 @@ class LMCBlender:
         attn_metadata,
     ):
         logger.debug(f"Blender is processing KV for layer {layer_id}")
+        if self._if_phase is not None:
+            return self._infoflow_process_qkv(
+                q, k, v, residual, layer_id, attn_output, attn_metadata
+            )
         old_k, old_v = self.gpu_connector.get_kv(layer_id)
 
         if attn_output is None:
@@ -263,6 +288,10 @@ class LMCBlender:
         """
         Perform blending for the given tokens.
         """
+        if self.infoflow_mode:
+            self._infoflow_blend(tokens, mask, **kwargs)
+            return
+
         layerwise_blender = self.blend_layer(tokens, mask, **kwargs)
 
         for i in range(self.num_layers + 2):
@@ -271,6 +300,171 @@ class LMCBlender:
         # Collect structured timing data from components
         if self.enable_layer_timing:
             self._collect_timing_data()
+
+    # ------------------------------------------------------------------
+    # InfoFlow KV (Teng et al., ICML'26; arXiv 2603.05353, Sec 4 + App F;
+    # official code github.com/tx467/InfoFlow-KV)
+    # ------------------------------------------------------------------
+    # The blend range is the cached context only; vLLM computes the query
+    # afterwards from the paged cache.  The adapter passes `query_tokens`.
+    # Pass 1 ("score"): layer-wise retrieve of the context KV (re-rotated to
+    #   GLOBAL positions by the GPU connector and written to vLLM's paged
+    #   cache) while only the query tokens are forwarded over it.  The query is
+    #   a suffix, so FlashAttention's bottom-right causal mask is exact.  The
+    #   "norm" score is accumulated at the scoring layers.
+    # Pass 2 ("recompute"): the top-k context tokens (first chunk excluded,
+    #   k = int(context_len * ratio), as in the official select_positions) are
+    #   recomputed at ALL layers against the stale KV read back from the paged
+    #   cache, with a position-aware causal mask (official recomputer uses
+    #   query_positions >= key_positions), and written back.
+    #   Disk I/O happens once, in pass 1.
+    def _infoflow_blend(self, tokens, mask=None, query_tokens=None, **kwargs):
+        if query_tokens is None or query_tokens.numel() == 0:
+            raise ValueError("InfoFlow needs the query tokens (see vllm_v1_adapter)")
+        device = torch.device("cuda")
+        ctx_len = tokens.shape[0]
+        all_tokens = torch.cat([tokens, query_tokens.to(tokens.device)])
+        self._if_ctx_len = ctx_len
+        self._if_kvcaches = kwargs["kvcaches"]
+        self._if_slot_mapping = kwargs["slot_mapping"].to(device)
+        self._if_scores = torch.zeros(ctx_len, dtype=torch.float32, device=device)
+
+        start_evt = torch.cuda.Event(enable_timing=True)
+        mid_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
+
+        # Pass 1: interleave layer-wise retrieval (context) with the
+        # query-only forward, mirroring blend_layer().
+        self._if_phase = "score"
+        executor = self.layerwise_model.compute_layer(all_tokens)
+        retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
+        next(retriever)
+        for _ in range(self.num_layers):
+            next(retriever)
+            next(executor)
+        next(retriever)
+        self.metadata.clean()
+
+        first_end = self.gpu_connector.chunk_ends[0]
+        candidates = torch.arange(first_end, ctx_len, device=device)
+        budget = min(int(ctx_len * self.infoflow_ratio), candidates.numel())
+        top = candidates[torch.topk(self._if_scores[candidates], k=budget).indices]
+        self._if_imp, _ = torch.sort(top)
+        mid_evt.record()
+
+        # Pass 2: recompute the selected context tokens at every layer.
+        self._if_phase = "recompute"
+        for _ in self.layerwise_model.compute_layer(tokens):
+            pass
+        end_evt.record()
+        end_evt.synchronize()
+
+        self.infoflow_stats = {
+            "context_tokens": ctx_len,
+            "query_tokens": int(query_tokens.numel()),
+            "first_chunk_tokens": first_end,
+            "recomputed_context_tokens": budget,
+            "score_pass_ms": start_evt.elapsed_time(mid_evt),
+            "recompute_pass_ms": mid_evt.elapsed_time(end_evt),
+        }
+        logger.info("InfoFlow blend: %s", self.infoflow_stats)
+        self.metadata.clean()
+        self._if_phase = None
+        self._if_scores = None
+
+    def _infoflow_process_qkv(
+        self, q, k, v, residual, layer_id, attn_output, attn_metadata
+    ):
+        if attn_output is None:
+            attn_output = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        if self.metadata.positions is None:
+            self.metadata.positions = torch.arange(
+                q.shape[0], device=q.device, dtype=torch.int64
+            )
+        attn_layer = self.layerwise_model.vllm_model.model.layers[layer_id].self_attn
+        q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
+        ctx_len = self._if_ctx_len
+
+        if layer_id == 0:
+            if self._if_phase == "score":
+                idx = torch.arange(ctx_len, q.shape[0], device=q.device)
+            else:
+                idx = self._if_imp
+            num = idx.shape[0]
+            q, k, v = q[idx], k[idx], v[idx]
+            residual = residual[idx]
+            self.metadata.imp_indices = idx
+            self.metadata.positions = self.metadata.positions[idx]
+            attn_output = attn_output[:num]
+            attn_metadata.max_query_len = num
+            attn_metadata.query_start_loc = torch.tensor(
+                [0, num], dtype=torch.int32, device=q.device
+            )
+
+        if self._if_phase == "score":
+            # Context KV from the retrieval buffer, query KV appended (suffix).
+            old_k, old_v = self.gpu_connector.get_kv(layer_id)
+            k_all = torch.cat([old_k[:ctx_len], k])
+            v_all = torch.cat([old_v[:ctx_len], v])
+            if layer_id in self.infoflow_layers:
+                self._infoflow_accumulate(q, k_all, layer_id)
+            return q, k_all, v_all, residual, attn_output, attn_metadata
+
+        old_k, old_v = self._paged_get_kv(layer_id)
+        idx = self.metadata.imp_indices
+        old_k[idx] = k
+        old_v[idx] = v
+        self._paged_put_kv(layer_id, idx, k, v)
+        attn_metadata.query_positions = self.metadata.positions
+        return q, old_k, old_v, residual, attn_output, attn_metadata
+
+    def _infoflow_accumulate(self, q, k_all, layer_id):
+        """Add this layer's InfoFlow "norm" score to every token's total.
+
+        Follows the official code (tx467/InfoFlow-KV,
+        llm/models/llama/kv_cache/importance_scorer.py::_compute_norm): mean of
+        the attention over heads, then the L2 norm over query tokens, summed over
+        the scoring layers.  (The paper's Eq. 7 states a plain column sum; the
+        released code, which produced their results, uses this L2 form.)
+        """
+        attn = self.layerwise_model.vllm_attn_layers[layer_id]
+        num_heads, num_kv, head = attn.num_heads, attn.num_kv_heads, attn.head_size
+        qh = q.view(-1, num_heads, head).float()
+        kh = k_all.view(-1, num_kv, head).float()
+        kh = kh.repeat_interleave(num_heads // num_kv, dim=1)
+        logits = torch.einsum("qhd,nhd->hqn", qh, kh) * (head ** -0.5)
+        q_pos = self.metadata.positions
+        key_pos = torch.arange(kh.shape[0], device=q.device)
+        logits.masked_fill_(key_pos[None, None, :] > q_pos[None, :, None], float("-inf"))
+        attn_mean = torch.softmax(logits, dim=-1).mean(dim=0)  # [Q, N]
+        self._if_scores += attn_mean[:, : self._if_ctx_len].norm(p=2, dim=0)
+
+    def _paged_slots(self, layer_id, slots):
+        kv = self._if_kvcaches[layer_id]
+        block_size = kv.shape[2]
+        return kv, slots // block_size, slots % block_size
+
+    def _paged_get_kv(self, layer_id):
+        """Gather this layer's [num_tokens, kv_dim] K/V from vLLM's paged cache."""
+        kv, blk, off = self._paged_slots(layer_id, self._if_slot_mapping)
+        if kv.shape[0] == 2:      # [2, num_blocks, block_size, heads, dim]
+            k, v = kv[0][blk, off], kv[1][blk, off]
+        else:                     # [num_blocks, 2, block_size, heads, dim]
+            k, v = kv[blk, 0, off], kv[blk, 1, off]
+        return k.flatten(1).clone(), v.flatten(1).clone()
+
+    def _paged_put_kv(self, layer_id, idx, k, v):
+        """Scatter recomputed K/V rows (token indices `idx`) into the paged cache."""
+        kv, blk, off = self._paged_slots(layer_id, self._if_slot_mapping[idx])
+        if kv.shape[0] == 2:
+            shape = kv[0][blk, off].shape
+            kv[0][blk, off] = k.view(shape)
+            kv[1][blk, off] = v.view(shape)
+        else:
+            shape = kv[blk, 0, off].shape
+            kv[blk, 0, off] = k.view(shape)
+            kv[blk, 1, off] = v.view(shape)
 
     def _collect_timing_data(self):
         """Gather per-layer timing from disk backend, gpu connector, and recompute events."""
