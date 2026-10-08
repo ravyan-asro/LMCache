@@ -106,12 +106,26 @@ class LMCBlender:
                 thresholds=None,
             )
 
+        # Optional runtime ratio override: LMCACHE_BLEND_RATIO_FILE holds one
+        # float, re-read before every blend, so a ratio sweep can run inside one
+        # engine (env changes do not reach the vLLM engine process).
+        self.ratio_file = os.getenv("LMCACHE_BLEND_RATIO_FILE")
+
         # This will be set during the blending process
         self.metadata = LMCBlendMetadata(
             imp_indices=None,
             attn_mask=None,
             positions=None,
         )
+
+    def _maybe_update_ratio(self):
+        if not self.ratio_file or not os.path.exists(self.ratio_file):
+            return
+        with open(self.ratio_file) as f:
+            ratio = float(f.read().strip())
+        self.infoflow_ratio = ratio
+        if not self.infoflow_mode and not self.epic_mode:
+            self.common_metadata.recomp_ratios = [ratio]
 
     def _compute_epic_indices(self, device: torch.device) -> torch.Tensor:
         """Compute static EPIC indices: first N tokens of each cached chunk."""
@@ -291,6 +305,7 @@ class LMCBlender:
         """
         Perform blending for the given tokens.
         """
+        self._maybe_update_ratio()
         if self.infoflow_mode:
             self._infoflow_blend(tokens, mask, **kwargs)
             return
@@ -412,6 +427,10 @@ class LMCBlender:
             **{f"{b}_ms": events[a].elapsed_time(events[b]) for a, b in zip(names, names[1:])},
         }
         logger.info("InfoFlow blend: %s", self.infoflow_stats)
+        # Per-layer disk / H2D / RoPE timing of the stage-1 retrieve (same
+        # collector and /tmp/blend_timing.json file as CacheBlend's breakdown).
+        if self.enable_layer_timing:
+            self._collect_timing_data()
         stats_path = os.getenv("LMCACHE_INFOFLOW_STATS_PATH")
         if stats_path:  # read back by the experiment driver (engine runs in a subprocess)
             import json
@@ -635,7 +654,7 @@ class LMCBlender:
             rank = 0
         if rank == 0:
             import json as _json
-            timing_path = "/tmp/blend_timing.json"
+            timing_path = os.getenv("LMCACHE_BLEND_TIMING_PATH", "/tmp/blend_timing.json")
             try:
                 # Convert any non-serializable keys (int layer ids) to strings
                 serializable = {}

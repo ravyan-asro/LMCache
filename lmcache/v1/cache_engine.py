@@ -576,6 +576,12 @@ class LMCacheEngine:
 
                 to_count_down.extend(mem_objs_layer) # count down the reference count of the memory objects
 
+            # Advance the storage generator past its last yield so it records the
+            # LAST layer's disk-read stats (layer-timing only).  Without this, the
+            # last layer's reads stayed buffered and were merged into the next
+            # request's layer 0, whose window then spanned the gap between requests.
+            next(get_generator, None)
+
             # TODO(Jiayi): Need to be done in a modular way
             for keys_layer in keys_layer_major:
                 self.storage_manager.batched_unpin(keys_layer)

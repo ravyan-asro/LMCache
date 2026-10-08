@@ -467,7 +467,7 @@ class IndexCacheBlender:
             "indexcache_total_size_gb": (ca_bytes + la_bytes) / (1024 ** 3),
         }
 
-        stats_path = "/tmp/indexcache_stats.json"
+        stats_path = os.getenv("LMCACHE_INDEXCACHE_STATS_PATH", "/tmp/indexcache_stats.json")
         with open(stats_path, "w") as f:
             json.dump(stats, f)
         logger.info(
