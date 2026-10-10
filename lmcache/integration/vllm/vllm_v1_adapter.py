@@ -334,6 +334,8 @@ class LMCacheConnectorV1Impl:
                 os.environ.get("LMCACHE_INDEXCACHE_MODE", "0") == "1"
             )
             self._indexcache_blender_ref = None
+            # For the store-only check in get_num_new_matched_tokens.
+            self.enable_blending = bool(getattr(config, "enable_blending", False))
 
             # IndexCache TP>1 state (scheduler side)
             _gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
@@ -1034,6 +1036,18 @@ class LMCacheConnectorV1Impl:
         # In, full-prompt-hit case, we need to recompute the last token
         if num_external_hit_tokens == request.num_tokens:
             need_to_allocate -= 1
+            # Blending: a prompt that is entirely cached is a store-only document
+            # request of the drivers (real requests always end with question tokens
+            # past the cached context).  Blending it would run with no query tokens
+            # (InfoFlow raises; CacheBlend finds no loaded layer), so treat it as a
+            # miss: vLLM recomputes the document and it is stored again.  Happens
+            # with KV in CPU memory, where a document can still be cached when the
+            # next entry stores it (H200 smoke, 10-10); disk runs wipe the store.
+            if (getattr(self, "enable_blending", False)
+                    and not getattr(self, "enable_indexcache", False)):
+                logger.info("Reqid: %s, full-prompt hit with blending: store-only "
+                            "request, not loaded", request.request_id)
+                return 0
 
         logger.info(
             "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
