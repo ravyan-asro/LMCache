@@ -173,8 +173,36 @@ class LocalDiskBackend(StorageBackendInterface):
         libc = self._get_libc()
         libc.free(buf_ptr)
 
+    def _read_slot(self, nbytes: int):
+        """Per-process SSD bandwidth cap (LMCACHE_DISK_READ_GBPS, decimal GB/s;
+        0 or unset = no cap).  Reads reserve consecutive slots of nbytes / cap
+        seconds and do not complete before their slot ends, so this process
+        reads at min(cap, device) -- one SSD's share per GPU.  Returns the
+        slot's end time, or None without a cap."""
+        if not hasattr(self, "_read_cap_bps"):
+            cap = float(os.environ.get("LMCACHE_DISK_READ_GBPS", "0") or 0)
+            self._read_cap_bps = cap * 1e9
+            self._read_slot_lock = threading.Lock()
+            self._read_next_free = 0.0
+            if cap > 0:
+                logger.info("Disk reads capped at %.2f GB/s per process", cap)
+        if self._read_cap_bps <= 0:
+            return None
+        with self._read_slot_lock:
+            start = max(time.perf_counter(), self._read_next_free)
+            self._read_next_free = start + nbytes / self._read_cap_bps
+            return self._read_next_free
+
+    @staticmethod
+    def _wait_slot(deadline):
+        if deadline is not None:
+            delay = deadline - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+
     def _read_direct_into(self, path: str, memory_obj: MemoryObj, size: int) -> None:
         padded_size = self._round_up(size)
+        deadline = self._read_slot(padded_size)
         buf_view, buf_ptr = self._alloc_aligned_buffer(padded_size)
         fd = None
         try:
@@ -188,6 +216,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 offset += read
                 remaining -= read
             memory_obj.byte_array.cast('B')[:size] = buf_view.cast('B')[:size]
+            self._wait_slot(deadline)
         finally:
             if fd is not None:
                 os.close(fd)
@@ -196,6 +225,7 @@ class LocalDiskBackend(StorageBackendInterface):
     def _read_direct_dummy(self, path: str, size: int) -> None:
         """Read a file into a scratch aligned buffer and discard (for BW simulation)."""
         padded_size = self._round_up(size)
+        deadline = self._read_slot(padded_size)
         buf_view, buf_ptr = self._alloc_aligned_buffer(padded_size)
         fd = None
         try:
@@ -208,6 +238,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     break
                 offset += read
                 remaining -= read
+            self._wait_slot(deadline)
         finally:
             if fd is not None:
                 os.close(fd)
