@@ -26,7 +26,9 @@ fully visible ones: 5.5 / 11 / 20 ms per layer, same mask.
 
 # Third Party
 import torch
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+_BLOCK = 128
 
 _flex = None
 
@@ -40,17 +42,47 @@ def _compiled_flex():
     return _flex
 
 
-def position_block_mask(q_pos: torch.Tensor, kv_len: int):
+def position_block_mask(q_pos: torch.Tensor, kv_len: int, block: int = _BLOCK):
     """Block mask for query positions `q_pos` (sorted) over keys 0..kv_len-1;
-    None when there are no queries."""
+    None when there are no queries.
+
+    Built from the positions instead of create_block_mask, which evaluates the
+    mask densely (Lq x Lk index tensors: 28 GiB at 61K x 61K, OOM in the 64K
+    CacheBlend sweep at ratio 1.0, 10-11).  Queries are sorted, so for query
+    block i and key block j: every key of j visible to every row iff
+    last_key(j) <= min position(i) (full block, no mask applied); some visible
+    iff first_key(j) <= max position(i) (partial block, mask_mod applied);
+    else skipped.  Same blocks and bit-identical outputs as create_block_mask
+    (checked 10-11)."""
     if q_pos.numel() == 0:
         return None
+    lq, dev = q_pos.numel(), q_pos.device
+    nqb, nkb = -(-lq // block), -(-kv_len // block)
+    pad = nqb * block - lq
+    q_min = torch.nn.functional.pad(q_pos, (0, pad), value=kv_len).view(nqb, block).amin(1)
+    q_max = torch.nn.functional.pad(q_pos, (0, pad), value=-1).view(nqb, block).amax(1)
+    k_first = torch.arange(nkb, device=dev) * block
+    k_last = torch.clamp(k_first + block, max=kv_len) - 1
+    full = k_last[None, :] <= q_min[:, None]
+    partial = (k_first[None, :] <= q_max[:, None]) & ~full
+    if pad:
+        # as create_block_mask: padded rows fail the mask, so no block of the
+        # last query block is full (keeps outputs bit-identical to it)
+        partial[-1] |= full[-1]
+        full[-1] = False
+
+    def to_kv_blocks(m):
+        num = m.sum(1, dtype=torch.int32)
+        idx = torch.argsort((~m).to(torch.int8), dim=1, stable=True).to(torch.int32)
+        return num[None, None], idx[None, None]
 
     def mask_mod(b, h, q_idx, kv_idx):
         return q_pos[q_idx] >= kv_idx
 
-    return create_block_mask(mask_mod, None, None, q_pos.shape[0], kv_len,
-                             device=q_pos.device)
+    kv_num, kv_idx = to_kv_blocks(partial)
+    full_num, full_idx = to_kv_blocks(full)
+    return BlockMask.from_kv_blocks(kv_num, kv_idx, full_num, full_idx, BLOCK_SIZE=block,
+                                    mask_mod=mask_mod, seq_lengths=(lq, kv_len))
 
 
 def position_masked_attention(q, k, v, q_pos, scale, block_mask=None):
