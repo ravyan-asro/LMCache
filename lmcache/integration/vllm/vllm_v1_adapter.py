@@ -1128,12 +1128,28 @@ class LMCacheConnectorV1Impl:
 
         meta = LMCacheConnectorMetadata()
 
+        # Blending: a request that loads KV from LMCache is a drivers' measured
+        # (blended) request; its KV is never saved, in any step.  Previously
+        # LMCACHE_SKIP_SAVE was meant to do this, but the drivers set it after the
+        # engine process had started, so it never took effect and every KV-reuse
+        # run also saved the measured request's KV (O25; Rya 10-10: remove it).
+        # Store-only document requests load nothing and are still saved.  SIFT's
+        # IndexCache mode is excluded (it does not use this save path).
+        no_save = getattr(self, "_no_save_reqs", None)
+        if no_save is None:
+            no_save = self._no_save_reqs = set()
+        blend_no_save = (getattr(self, "enable_blending", False)
+                         and not getattr(self, "enable_indexcache", False))
+
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
+            no_save.discard(finished_req_id)
 
         for request in scheduler_output.scheduled_new_reqs:
             # Right now, we only load KV for new requests
             load_spec = self.load_specs.pop(request.req_id, None)
+            if blend_no_save and load_spec is not None:
+                no_save.add(request.req_id)
             num_tokens_to_compute = (
                 request.num_computed_tokens
                 + scheduler_output.num_scheduled_tokens[request.req_id]
@@ -1153,7 +1169,7 @@ class LMCacheConnectorV1Impl:
                 self._block_size,
                 self._lmcache_chunk_size,
                 load_spec=load_spec,
-                skip_save=force_skip_save,
+                skip_save=force_skip_save or request.req_id in no_save,
                 discard_partial_chunks=self._discard_partial_chunks,
             )
             if req_meta is not None:
@@ -1174,7 +1190,7 @@ class LMCacheConnectorV1Impl:
                     self._block_size,
                     self._lmcache_chunk_size,
                     load_spec=None,
-                    skip_save=force_skip_save,
+                    skip_save=force_skip_save or req.req_id in no_save,
                     discard_partial_chunks=self._discard_partial_chunks,
                 )
                 if req_meta is not None:
@@ -1203,7 +1219,7 @@ class LMCacheConnectorV1Impl:
                 self._block_size,
                 self._lmcache_chunk_size,
                 load_spec=None,
-                skip_save=force_skip_save,
+                skip_save=force_skip_save or req_id in no_save,
                 discard_partial_chunks=self._discard_partial_chunks,
             )
             if req_meta is not None:
