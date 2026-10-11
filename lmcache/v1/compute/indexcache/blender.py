@@ -18,6 +18,8 @@ import math
 import os
 import time
 
+import numpy as np
+
 import torch
 
 from lmcache.logging import init_logger
@@ -383,7 +385,6 @@ class IndexCacheBlender:
         block_sparsity = 1.0 - (total_sparse_blocks / total_dense_blocks) if total_dense_blocks > 0 else 0.0
 
         # --- CA / LA sparsity from chunk_metadata (same as test script) ---
-        bitmask = torch.tensor([1 << i for i in reversed(range(8))], dtype=torch.uint8)
         chunk_num_pages = [cl // page_size for cl, _, _ in self.chunk_metadata]
         doc_page_offsets = [0]
         for np_ in chunk_num_pages:
@@ -409,6 +410,12 @@ class IndexCacheBlender:
             dp = doc_page_offsets[d + 1] - doc_page_offsets[d]
             page_to_doc_end.extend([doc_page_offsets[d + 1]] * dp)
 
+        # Bit counting in single-threaded numpy.  In the pipelined path this runs
+        # at the end of blend(), on the CPU while the GPU runs the forward: the
+        # former per-bit .item() loop plus OpenMP torch ops took 0.3-1.2 s on a
+        # shared node and outran the forward, adding up to ~400 ms to TTFT
+        # (H200, 10-10).  Now ~11 ms; same counts (checked on MuSiQue 32K).
+        doc_weight = total_doc_pages - np.asarray(page_to_doc_end, dtype=np.int64)
         active_CA_tiles = 0
         active_LA_tiles = 0
         for layer_idx in range(num_layers):
@@ -418,28 +425,18 @@ class IndexCacheBlender:
                 continue
 
             # CA: count selected pages from bit-packed kvcolidx
-            # kvcolidx is now (B, H, num_bytes) uint8 bit vector per chunk
-            global_page = 0
+            # kvcolidx is now (B, H, num_bytes) uint8 bit vector per chunk;
+            # a selected page p of chunk c adds (pages after p's document).
             for chunk_idx in range(num_docs - 1):
-                kv = self.chunk_metadata[chunk_idx][1][layer_idx][0]  # (H, num_bytes) uint8
+                kv = self.chunk_metadata[chunk_idx][1][layer_idx][0].numpy()  # (H, num_bytes)
                 n_pages = chunk_num_pages[chunk_idx]
-                for h_idx in range(H):
-                    kv_h = kv[h_idx]  # (num_bytes,) uint8
-                    # Unpack bits for this chunk
-                    for page_idx in range(n_pages):
-                        byte_idx = page_idx // 8
-                        bit_offset = 7 - (page_idx % 8)
-                        if (kv_h[byte_idx].item() >> bit_offset) & 1:
-                            gp = pages_before[chunk_idx] + page_idx
-                            if 0 <= gp < len(page_to_doc_end):
-                                active_CA_tiles += total_doc_pages - page_to_doc_end[gp]
-                global_page += n_pages
+                heads_per_page = np.unpackbits(kv, axis=-1)[:, :n_pages].sum(axis=0, dtype=np.int64)
+                start = pages_before[chunk_idx]
+                active_CA_tiles += int(heads_per_page @ doc_weight[start:start + n_pages])
 
-            # LA: count hot bits (vectorized — same as before)
-            hot_tile_list = [meta[2][layer_idx] for meta in self.chunk_metadata]
-            layer_code = torch.cat(hot_tile_list, dim=-1)[0]  # (H, total_bytes)
-            active_bits = torch.bitwise_and(layer_code.unsqueeze(-1), bitmask) > 0
-            active_LA_tiles += active_bits.sum().item()
+            # LA: count hot bits
+            for meta in self.chunk_metadata:
+                active_LA_tiles += int(np.unpackbits(meta[2][layer_idx][0].numpy()).sum(dtype=np.int64))
 
         sparsity_total = 1.0 - (active_CA_tiles + active_LA_tiles) / total_tiles if total_tiles > 0 else 0.0
         sparsity_ca = 1.0 - active_CA_tiles / total_CA_tiles if total_CA_tiles > 0 else 0.0
