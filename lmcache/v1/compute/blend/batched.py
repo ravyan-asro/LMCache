@@ -17,6 +17,24 @@
 # per-request path reads a contiguous loaded-K buffer, this reads the paged
 # cache: same values, and no gather.  The question tokens are computed
 # afterwards by vLLM's own forward, as in the per-request path.
+#
+# BatchedBlender.infoflow: InfoFlow KV for several requests, the same algorithm
+# as LMCBlender._infoflow_blend (no reorder; the per-request path behind the
+# paper's InfoFlow numbers):
+#   pass 1   the question tokens only, every layer, attending to the request's
+#            loaded context K/V followed by their own fresh K/V (bottom-right
+#            causal = exact); at the scoring layers every context token gets
+#            the L2 norm over question tokens of the head-mean attention
+#   select   top int(ctx * ratio) by score, first document excluded
+#   pass 2   the selected tokens only, every layer, from the embeddings; their
+#            K/V are written into the paged cache and they attend to the
+#            request's context K/V with a position-correct causal mask
+#            (flashinfer custom mask, as LMCache's InfoFlow attention)
+# Pass 2 starts from the selected tokens' embeddings; the per-request path
+# runs layer 0's QKV projection on every context token and then subsets
+# (same result, slightly more work).  Question K/V of pass 1 are not kept:
+# vLLM computes the question afterwards from the updated context, as in the
+# per-request path.
 
 # Standard
 from typing import List, Optional
@@ -181,3 +199,145 @@ class BatchedBlender:
             return {"hidden": hidden_states, "residual": residual, "sel": sel,
                     "cu_q": cu_q, "cu_k": cu_k}
         return None
+
+    # -- InfoFlow ----------------------------------------------------------------
+    def _layers(self):
+        m = self.model
+        return m.vllm_model.model.layers[m.vllm_model.model.start_layer: m.vllm_model.model.end_layer]
+
+    def _qkv(self, idx, layer, hidden_states, residual, positions):
+        m = self.model
+        if residual is None:
+            residual = hidden_states
+            hidden_states = layer.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+        attn = layer.self_attn
+        qkv, _ = attn.qkv_proj(hidden_states)
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+        H = m.vllm_attn_layers[idx].num_heads
+        Hk = m.vllm_attn_layers[idx].num_kv_heads
+        D = m.vllm_attn_layers[idx].head_size
+        if m.has_qk_norm:
+            q = attn.q_norm(q.view(*q.shape[:-1], H, D)).view(q.shape)
+            k = attn.k_norm(k.view(*k.shape[:-1], Hk, D)).view(k.shape)
+        q, k = attn.rotary_emb(positions, q, k)
+        return q.view(-1, H, D), k.view(-1, Hk, D), v.view(-1, Hk, D), residual, H, Hk, D
+
+    def _finish_layer(self, layer, out, residual, H, D):
+        attn = layer.self_attn
+        hidden_states, _ = attn.o_proj(out.view(-1, H * D))
+        hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+        hidden_states = getattr(layer, self.model.mlp_attr)(hidden_states)
+        return hidden_states, residual
+
+    @staticmethod
+    def _score(q, k_all, q_pos, ctx_len, H, Hk, D):
+        """LMCBlender._infoflow_accumulate for one request: head-mean attention,
+        L2 norm over query tokens, context part."""
+        qh = q.float()
+        kh = k_all.float().repeat_interleave(H // Hk, dim=1)
+        logits = torch.einsum("qhd,nhd->hqn", qh, kh) * (D ** -0.5)
+        key_pos = torch.arange(kh.shape[0], device=q.device)
+        logits.masked_fill_(key_pos[None, None, :] > q_pos[None, :, None], float("-inf"))
+        attn_mean = torch.softmax(logits, dim=-1).mean(dim=0)       # [Q, N]
+        return attn_mean[:, :ctx_len].norm(p=2, dim=0)
+
+    @torch.no_grad()
+    def infoflow(
+        self,
+        token_ids: List[torch.Tensor],
+        query_ids: List[torch.Tensor],
+        first_lens: List[int],
+        block_table: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        ratio: float,
+        score_layers: List[int],
+        force_sel: Optional[List[torch.Tensor]] = None,
+    ) -> dict:
+        """
+        token_ids:   per request, the context tokens whose KV was loaded
+                     (positions 0..len-1).
+        query_ids:   per request, the question tokens (positions len..).
+        first_lens:  per request, the first document's length (excluded from
+                     selection, as InfoFlow's official code).
+        block_table: (B, max_blocks) int32, each request's context KV blocks.
+        force_sel:   tests only: per request, the selected indices to use.
+        Returns {"sel": per request selected context indices (sorted),
+                 "scores": per request scores}.
+        """
+        import flashinfer
+
+        m = self.model
+        dev = block_table.device
+        B = len(token_ids)
+        lens = [int(t.numel()) for t in token_ids]
+        qlens = [int(t.numel()) for t in query_ids]
+        block_size = kv_caches[0].shape[2]
+        layers = self._layers()
+
+        def ctx_slots(b, pos):
+            return block_table[b, pos // block_size].long() * block_size + pos % block_size
+
+        all_slots = [ctx_slots(b, torch.arange(n, device=dev)) for b, n in enumerate(lens)]
+
+        def gather(kv, b):
+            s = all_slots[b]
+            return kv[0][s // block_size, s % block_size], kv[1][s // block_size, s % block_size]
+
+        # ---- pass 1: question tokens, every layer, scores at score_layers ----
+        q_pos = [torch.arange(n, n + ql, device=dev) for n, ql in zip(lens, qlens)]
+        positions = torch.cat(q_pos)
+        cu_q = _cumsum0(qlens, dev)
+        kv_lens = [n + ql for n, ql in zip(lens, qlens)]
+        cu_k = _cumsum0(kv_lens, dev)
+        scores = [torch.zeros(n, dtype=torch.float32, device=dev) for n in lens]
+        hidden_states = m._embed(torch.cat([t.to(dev) for t in query_ids]))
+        residual = None
+        for idx, layer in enumerate(layers):
+            q, k, v, residual, H, Hk, D = self._qkv(idx, layer, hidden_states, residual, positions)
+            ks, vs = [], []
+            for b in range(B):
+                ck, cv = gather(kv_caches[idx], b)
+                lo, hi = int(cu_q[b]), int(cu_q[b + 1])
+                ks += [ck, k[lo:hi]]
+                vs += [cv, v[lo:hi]]
+                if idx in score_layers:
+                    scores[b] += self._score(q[lo:hi], torch.cat([ck, k[lo:hi]]), q_pos[b],
+                                             lens[b], H, Hk, D)
+            out = torch.empty_like(q)
+            self._attn(idx, q, torch.cat(ks), torch.cat(vs), out, cu_q, max(qlens),
+                       max(kv_lens), cu_k=cu_k)
+            hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
+
+        # ---- select ----
+        sel = []
+        for b in range(B):
+            if force_sel is not None:
+                sel.append(force_sel[b].to(dev).sort().values)
+                continue
+            cand = torch.arange(first_lens[b], lens[b], device=dev)
+            k_ = min(int(lens[b] * ratio), cand.numel())
+            sel.append(cand[torch.topk(scores[b][cand], k=k_).indices].sort().values)
+
+        # ---- pass 2: selected tokens, every layer, position-correct mask ----
+        sel_lens = [int(s_.numel()) for s_ in sel]
+        cu_s = _cumsum0(sel_lens, dev)
+        positions = torch.cat(sel)
+        sel_slots = torch.cat([all_slots[b][sel[b]] for b in range(B)])
+        masks = [sel[b][:, None] >= torch.arange(lens[b], device=dev)[None, :] for b in range(B)]
+        hidden_states = m._embed(torch.cat([token_ids[b].to(dev)[sel[b]] for b in range(B)]))
+        residual = None
+        for idx, layer in enumerate(layers):
+            q, k, v, residual, H, Hk, D = self._qkv(idx, layer, hidden_states, residual, positions)
+            self._write_kv(kv_caches[idx], sel_slots, k, v)
+            impl = m.vllm_attn_layers[idx].impl
+            out = torch.empty_like(q)
+            for b in range(B):
+                lo, hi = int(cu_s[b]), int(cu_s[b + 1])
+                ck, cv = gather(kv_caches[idx], b)
+                out[lo:hi] = flashinfer.single_prefill_with_kv_cache(
+                    q[lo:hi], ck, cv, custom_mask=masks[b], causal=False, kv_layout="NHD",
+                    sm_scale=impl.scale)
+            hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
+        return {"sel": sel, "scores": scores}
