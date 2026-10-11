@@ -110,12 +110,17 @@ class FusedRope:
     def fused_encode(self, old_positions, new_positions, k):
         num_tokens = k.shape[0]
         k = k.view(num_tokens, -1, self.head_size)
+        if self.cos_sin_cache.device != k.device:
+            # vLLM builds the cache on the CPU.  Copy it once: `.to()` on every
+            # call copied the whole table (max_position x rotary_dim fp32,
+            # 50-134 MB) host-to-device on every layer, 3-9 ms per layer (10-11).
+            self.cos_sin_cache = self.cos_sin_cache.to(k.device)
         lmc_ops.rotary_embedding_k_fused(
             old_positions,
             new_positions,
             k,
             self.head_size,
-            self.cos_sin_cache.to(k.device),
+            self.cos_sin_cache,
             self.is_neox_style,
         )
         k = k.view(num_tokens, -1)
