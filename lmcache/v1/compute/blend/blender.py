@@ -422,8 +422,12 @@ class LMCBlender:
 
         self._if_imp = torch.unique(torch.cat([sel, gaps]))  # sorted
         self._if_phase = "recompute"
-        for _ in self.layerwise_model.compute_layer(tokens):
-            pass
+        # Nothing to recompute when the context is one stored chunk (the first
+        # chunk is never selected) with no gaps: its loaded KV stays as is.  A
+        # zero-token pass would launch zero-size kernels (2WikiMQA original, 10-11).
+        if self._if_imp.numel() > 0:
+            for _ in self.layerwise_model.compute_layer(tokens):
+                pass
         mark("end")
         events["end"].synchronize()
 

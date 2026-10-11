@@ -41,7 +41,10 @@ def _compiled_flex():
 
 
 def position_block_mask(q_pos: torch.Tensor, kv_len: int):
-    """Block mask for query positions `q_pos` (sorted) over keys 0..kv_len-1."""
+    """Block mask for query positions `q_pos` (sorted) over keys 0..kv_len-1;
+    None when there are no queries."""
+    if q_pos.numel() == 0:
+        return None
 
     def mask_mod(b, h, q_idx, kv_idx):
         return q_pos[q_idx] >= kv_idx
@@ -52,6 +55,11 @@ def position_block_mask(q_pos: torch.Tensor, kv_len: int):
 
 def position_masked_attention(q, k, v, q_pos, scale, block_mask=None):
     """q: (Lq, H, D); k, v: (Lk, Hk, D) (NHD, GQA allowed).  Returns (Lq, H, D)."""
+    if q.shape[0] == 0:
+        # Nothing selected (InfoFlow never selects from the first document, so a
+        # one-document context keeps all its loaded KV): FlexAttention cannot
+        # compile a zero-length query (2WikiMQA original, 10-11).
+        return q.new_empty(q.shape)
     if block_mask is None:
         block_mask = position_block_mask(q_pos, k.shape[0])
     # Contiguous (H, L, D) inputs: the dynamic-shape kernel took 8.7 ms with the

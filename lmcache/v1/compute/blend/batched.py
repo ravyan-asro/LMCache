@@ -342,6 +342,8 @@ class BatchedBlender:
 
         # ---- pass 2: selected tokens, every layer, position-correct mask ----
         sel_lens = [int(s_.numel()) for s_ in sel]
+        if sum(sel_lens) == 0:      # one-document contexts: nothing to recompute
+            return {"sel": sel, "scores": scores}
         cu_s = _cumsum0(sel_lens, dev)
         positions = torch.cat(sel)
         sel_slots = torch.cat([all_slots[b][sel[b]] for b in range(B)])
