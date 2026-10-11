@@ -54,8 +54,12 @@ def position_masked_attention(q, k, v, q_pos, scale, block_mask=None):
     """q: (Lq, H, D); k, v: (Lk, Hk, D) (NHD, GQA allowed).  Returns (Lq, H, D)."""
     if block_mask is None:
         block_mask = position_block_mask(q_pos, k.shape[0])
+    # Contiguous (H, L, D) inputs: the dynamic-shape kernel took 8.7 ms with the
+    # strided NHD -> HND views vs 5.4 ms contiguous (20% of 32K, Llama shapes,
+    # H200, 10-11); the copies cost ~0.2 ms.
     out = _compiled_flex()(
-        q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None],
+        q.transpose(0, 1).contiguous()[None], k.transpose(0, 1).contiguous()[None],
+        v.transpose(0, 1).contiguous()[None],
         block_mask=block_mask, scale=scale, enable_gqa=True,
     )
     return out[0].transpose(0, 1)

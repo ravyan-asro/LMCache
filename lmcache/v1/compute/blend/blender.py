@@ -27,6 +27,10 @@ from lmcache.v1.compute.models.utils import infer_model_from_vllm
 
 logger = init_logger(__name__)
 
+# CacheBlend's kept tokens attend with a position-correct causal mask unless
+# this is set (then FA's bottom-right causal alignment, as the authors' code).
+BLEND_AUTHORS_MASK = os.getenv("LMCACHE_BLEND_AUTHORS_MASK", "0") == "1"
+
 
 class LMCBlender:
     """
@@ -231,6 +235,16 @@ class LMCBlender:
         if self.metadata.imp_indices is not None:
             old_k[self.metadata.imp_indices] = k
             old_v[self.metadata.imp_indices] = v
+            if not BLEND_AUTHORS_MASK:
+                # The kept queries are scattered through the context, so each
+                # may attend only to keys at or before its own position.  FA's
+                # causal=True with Lq < Lk aligns bottom-right instead (row i
+                # treated as position Lk - Lq + i), which lets early selected
+                # tokens see later ones; the authors' code does that
+                # (CacheBlend vllm_blend xformers.py LowerTriangularFromBottom-
+                # RightMask).  Position-correct per Rya 10-11; set
+                # LMCACHE_BLEND_AUTHORS_MASK=1 for the authors' mask.
+                attn_metadata.query_positions = self.metadata.positions
             return q, old_k, old_v, residual, attn_output, attn_metadata
         else:
             return q, k, v, residual, attn_output, attn_metadata

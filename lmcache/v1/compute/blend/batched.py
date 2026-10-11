@@ -9,8 +9,10 @@
 #   check_layer (1)        every token; per request the top `ratio` tokens by
 #                          sum((K_fresh - K_loaded)^2) are kept; their K/V are
 #                          written into the paged cache, and the kept queries
-#                          attend to the request's full K/V (bottom-right
-#                          causal alignment, as the per-request path)
+#                          attend to the request's full K/V with a position-
+#                          correct causal mask (position-masked FlexAttention,
+#                          as the per-request path; Rya 10-11), or FA's
+#                          bottom-right alignment with LMCACHE_BLEND_AUTHORS_MASK=1
 #   later layers           kept tokens only, same write + attention
 # The loaded KV must already be in vLLM's paged cache with its positions
 # re-encoded for the request (the async loader does this).  Where the
@@ -47,6 +49,7 @@ from lmcache.v1.compute.attention.position_masked import (
     position_block_mask,
     position_masked_attention,
 )
+from lmcache.v1.compute.blend.blender import BLEND_AUTHORS_MASK
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 
 try:
@@ -81,6 +84,10 @@ class BatchedBlender:
     def _read_k(self, kv, slot_mapping):
         blk, off = self._slots(kv, slot_mapping)
         return kv[0][blk, off]                    # [T, H_kv, D]
+
+    def _read_kv(self, kv, slot_mapping):
+        blk, off = self._slots(kv, slot_mapping)
+        return kv[0][blk, off], kv[1][blk, off]
 
     def _write_kv(self, kv, slot_mapping, k, v):
         blk, off = self._slots(kv, slot_mapping)
@@ -180,6 +187,9 @@ class BatchedBlender:
                     top = torch.topk(diff_k[lo:hi], k=int((hi - lo) * self.ratio)).indices
                     picks.append(torch.sort(top).values + lo)
                 sel = torch.cat(picks)
+                # per request: kept positions and their block mask (built once)
+                local = [p - int(cu_k[b]) for b, p in enumerate(picks)]
+                masks = [position_block_mask(local[b], lens[b]) for b in range(B)]
                 q_lens = [int(p.numel()) for p in picks]
                 cu_q, max_q = _cumsum0(q_lens, dev), max(q_lens)
                 q, k, v, residual = q[sel], k[sel], v[sel], residual[sel]
@@ -190,10 +200,18 @@ class BatchedBlender:
             out = torch.empty_like(q)
             if idx < self.check_layer:
                 self._attn(idx, q, k, v, out, cu_q, max_q, max_k, cu_k=cu_k)
-            else:
+            elif BLEND_AUTHORS_MASK:
                 self._write_kv(kv, slot_mapping[sel], k, v)
                 self._attn(idx, q, kv[0], kv[1], out, cu_q, max_q, max_k,
                            seqused_k=seqused_k, block_table=block_table)
+            else:
+                self._write_kv(kv, slot_mapping[sel], k, v)
+                scale = m.vllm_attn_layers[idx].impl.scale
+                for b in range(B):
+                    lo, hi = int(cu_q[b]), int(cu_q[b + 1])
+                    ck, cv = self._read_kv(kv, slot_mapping[int(cu_k[b]):int(cu_k[b + 1])])
+                    out[lo:hi] = position_masked_attention(q[lo:hi], ck, cv, local[b], scale,
+                                                           block_mask=masks[b])
 
             hidden_states, _ = attn.o_proj(out.view(-1, num_heads * head_size))
             hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
