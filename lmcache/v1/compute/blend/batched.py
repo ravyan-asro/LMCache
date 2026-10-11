@@ -29,7 +29,7 @@
 #   pass 2   the selected tokens only, every layer, from the embeddings; their
 #            K/V are written into the paged cache and they attend to the
 #            request's context K/V with a position-correct causal mask
-#            (flashinfer custom mask, as LMCache's InfoFlow attention)
+#            (position-masked FlexAttention, as LMCache's InfoFlow attention)
 # Pass 2 starts from the selected tokens' embeddings; the per-request path
 # runs layer 0's QKV projection on every context token and then subsets
 # (same result, slightly more work).  Question K/V of pass 1 are not kept:
@@ -43,6 +43,10 @@ from typing import List, Optional
 import torch
 
 # First Party
+from lmcache.v1.compute.attention.position_masked import (
+    position_block_mask,
+    position_masked_attention,
+)
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 
 try:
@@ -266,8 +270,6 @@ class BatchedBlender:
         Returns {"sel": per request selected context indices (sorted),
                  "scores": per request scores}.
         """
-        import flashinfer
-
         m = self.model
         dev = block_table.device
         B = len(token_ids)
@@ -325,7 +327,7 @@ class BatchedBlender:
         cu_s = _cumsum0(sel_lens, dev)
         positions = torch.cat(sel)
         sel_slots = torch.cat([all_slots[b][sel[b]] for b in range(B)])
-        masks = [sel[b][:, None] >= torch.arange(lens[b], device=dev)[None, :] for b in range(B)]
+        masks = [position_block_mask(sel[b], lens[b]) for b in range(B)]
         hidden_states = m._embed(torch.cat([token_ids[b].to(dev)[sel[b]] for b in range(B)]))
         residual = None
         for idx, layer in enumerate(layers):
@@ -336,8 +338,7 @@ class BatchedBlender:
             for b in range(B):
                 lo, hi = int(cu_s[b]), int(cu_s[b + 1])
                 ck, cv = gather(kv_caches[idx], b)
-                out[lo:hi] = flashinfer.single_prefill_with_kv_cache(
-                    q[lo:hi], ck, cv, custom_mask=masks[b], causal=False, kv_layout="NHD",
-                    sm_scale=impl.scale)
+                out[lo:hi] = position_masked_attention(q[lo:hi], ck, cv, sel[b], impl.scale,
+                                                       block_mask=masks[b])
             hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
         return {"sel": sel, "scores": scores}

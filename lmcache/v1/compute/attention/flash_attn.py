@@ -64,18 +64,22 @@ class LMCFlashAttnBackend(AttentionInterface):
         if query_positions is not None:
             # Non-contiguous query rows (InfoFlow recompute): each query may
             # attend only to keys at or before its own position.  FA's
-            # bottom-right causal alignment would be wrong here.
-            import flashinfer
+            # bottom-right causal alignment would be wrong here.  The block
+            # mask is built at the first layer and reused by the others
+            # (attn_metadata is created per compute_layer() pass).
+            from lmcache.v1.compute.attention.position_masked import (
+                position_block_mask,
+                position_masked_attention,
+            )
 
-            key_positions = torch.arange(key.shape[0], device=key.device)
-            mask = query_positions[:, None] >= key_positions[None, :]
+            block_mask = getattr(attn_metadata, "query_block_mask", None)
+            if block_mask is None:
+                block_mask = position_block_mask(query_positions, key.shape[0])
+                attn_metadata.query_block_mask = block_mask
             output.copy_(
-                flashinfer.single_prefill_with_kv_cache(
-                    query, key, value,
-                    custom_mask=mask,
-                    causal=False,
-                    kv_layout="NHD",
-                    sm_scale=self.vllm_attn_impl.scale,
+                position_masked_attention(
+                    query, key, value, query_positions,
+                    self.vllm_attn_impl.scale, block_mask=block_mask,
                 )
             )
             return output
