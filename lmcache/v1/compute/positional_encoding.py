@@ -46,6 +46,8 @@ def vllm_get_rope(head_size, rotary_dim=None, max_position=8192, base=10000.0,
         return _vllm_get_rope_raw(
             head_size, rotary_dim, max_position, base,
             is_neox_style, rope_scaling, dtype, partial_rotary_factor)
+import threading
+
 import torch
 
 # First Party
@@ -91,6 +93,9 @@ class BasicReverseRope:
         return self.reverse_encode(positions, q, k)
 
 
+_COS_SIN_LOCK = threading.Lock()
+
+
 class FusedRope:
     """
     Directly use the fused kernel to rotate K cache from
@@ -114,7 +119,15 @@ class FusedRope:
             # vLLM builds the cache on the CPU.  Copy it once: `.to()` on every
             # call copied the whole table (max_position x rotary_dim fp32,
             # 50-134 MB) host-to-device on every layer, 3-9 ms per layer (10-11).
-            self.cos_sin_cache = self.cos_sin_cache.to(k.device)
+            # Callers on other threads / CUDA streams (the Exp 3 loader's I/O
+            # threads) may race here: copy under a lock and wait for the copy
+            # before publishing, so nobody launches on a table still in flight
+            # (illegal memory accesses, 10-12).
+            with _COS_SIN_LOCK:
+                if self.cos_sin_cache.device != k.device:
+                    cache = self.cos_sin_cache.to(k.device)
+                    torch.cuda.current_stream(k.device).synchronize()
+                    self.cos_sin_cache = cache
         lmc_ops.rotary_embedding_k_fused(
             old_positions,
             new_positions,
