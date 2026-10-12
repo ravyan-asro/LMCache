@@ -361,6 +361,16 @@ class LMCBlender:
             raise ValueError("InfoFlow needs the query tokens (see vllm_v1_adapter)")
         device = torch.device("cuda")
         query_tokens = query_tokens.to(tokens.device)
+        score_file = os.getenv("LMCACHE_INFOFLOW_SCORE_QUERY_FILE")
+        if score_file and os.path.exists(score_file):
+            # Score with the request's raw question (BOS + question tokens), as
+            # InfoFlow's own code does, instead of every token after the context
+            # (template + question + chat tags).  Written per request by the driver.
+            import json
+
+            with open(score_file) as f:
+                query_tokens = torch.tensor(json.load(f)["ids"], dtype=tokens.dtype,
+                                            device=tokens.device)
         ctx_len = tokens.shape[0]
         self._if_ctx_len = ctx_len
         self._if_kvcaches = kwargs["kvcaches"]
