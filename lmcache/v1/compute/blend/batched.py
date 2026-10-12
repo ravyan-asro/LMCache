@@ -58,6 +58,16 @@ except ImportError:
     from vllm.third_party.flashinfer.flashattn_hopper import flash_attn_varlen_func
 
 
+def _offsets(lengths: List[int]) -> List[int]:
+    """Python-side cumulative offsets (0, l0, l0+l1, ...).  Slicing with these
+    instead of int(cu[b]) on the GPU tensor avoids a device sync per request
+    per layer (~124 per request; each drains the GPU queue, 10-12 audit)."""
+    out = [0]
+    for n in lengths:
+        out.append(out[-1] + int(n))
+    return out
+
+
 def _cumsum0(lengths: List[int], device) -> torch.Tensor:
     out = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
     out[1:] = torch.tensor(lengths, dtype=torch.int32, device=device).cumsum(0)
@@ -138,6 +148,7 @@ class BatchedBlender:
         lens = [int(t.numel()) for t in token_ids]
         B = len(lens)
         cu_k = _cumsum0(lens, dev)
+        ok = _offsets(lens)
         seqused_k = torch.tensor(lens, dtype=torch.int32, device=dev)
         max_k = max(lens)
 
@@ -152,6 +163,7 @@ class BatchedBlender:
         residual = None
         sel = None                       # kept rows (global), after check_layer
         cu_q, max_q = cu_k, max_k
+        oq = ok
 
         layers = m.vllm_model.model.layers[
             m.vllm_model.model.start_layer: m.vllm_model.model.end_layer]
@@ -180,7 +192,7 @@ class BatchedBlender:
                 diff_k = torch.sum((k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1])
                 picks = []
                 for b in range(B):
-                    lo, hi = int(cu_k[b]), int(cu_k[b + 1])
+                    lo, hi = ok[b], ok[b + 1]
                     if force_sel is not None:
                         picks.append(force_sel[b].to(dev) + lo)
                         continue
@@ -188,10 +200,11 @@ class BatchedBlender:
                     picks.append(torch.sort(top).values + lo)
                 sel = torch.cat(picks)
                 # per request: kept positions and their block mask (built once)
-                local = [p - int(cu_k[b]) for b, p in enumerate(picks)]
+                local = [p - ok[b] for b, p in enumerate(picks)]
                 masks = [position_block_mask(local[b], lens[b]) for b in range(B)]
                 q_lens = [int(p.numel()) for p in picks]
                 cu_q, max_q = _cumsum0(q_lens, dev), max(q_lens)
+                oq = _offsets(q_lens)
                 q, k, v, residual = q[sel], k[sel], v[sel], residual[sel]
 
             q = q.view(-1, num_heads, head_size)
@@ -208,8 +221,8 @@ class BatchedBlender:
                 self._write_kv(kv, slot_mapping[sel], k, v)
                 scale = m.vllm_attn_layers[idx].impl.scale
                 for b in range(B):
-                    lo, hi = int(cu_q[b]), int(cu_q[b + 1])
-                    ck, cv = self._read_kv(kv, slot_mapping[int(cu_k[b]):int(cu_k[b + 1])])
+                    lo, hi = oq[b], oq[b + 1]
+                    ck, cv = self._read_kv(kv, slot_mapping[ok[b]:ok[b + 1]])
                     out[lo:hi] = position_masked_attention(q[lo:hi], ck, cv, local[b], scale,
                                                            block_mask=masks[b])
 
@@ -309,6 +322,7 @@ class BatchedBlender:
         q_pos = [torch.arange(n, n + ql, device=dev) for n, ql in zip(lens, qlens)]
         positions = torch.cat(q_pos)
         cu_q = _cumsum0(qlens, dev)
+        oq = _offsets(qlens)
         kv_lens = [n + ql for n, ql in zip(lens, qlens)]
         cu_k = _cumsum0(kv_lens, dev)
         scores = [torch.zeros(n, dtype=torch.float32, device=dev) for n in lens]
@@ -319,7 +333,7 @@ class BatchedBlender:
             ks, vs = [], []
             for b in range(B):
                 ck, cv = gather(kv_caches[idx], b)
-                lo, hi = int(cu_q[b]), int(cu_q[b + 1])
+                lo, hi = oq[b], oq[b + 1]
                 ks += [ck, k[lo:hi]]
                 vs += [cv, v[lo:hi]]
                 if idx in score_layers:
@@ -344,7 +358,7 @@ class BatchedBlender:
         sel_lens = [int(s_.numel()) for s_ in sel]
         if sum(sel_lens) == 0:      # one-document contexts: nothing to recompute
             return {"sel": sel, "scores": scores}
-        cu_s = _cumsum0(sel_lens, dev)
+        os_ = _offsets(sel_lens)
         positions = torch.cat(sel)
         sel_slots = torch.cat([all_slots[b][sel[b]] for b in range(B)])
         masks = [position_block_mask(sel[b], lens[b]) for b in range(B)]
@@ -356,7 +370,7 @@ class BatchedBlender:
             impl = m.vllm_attn_layers[idx].impl
             out = torch.empty_like(q)
             for b in range(B):
-                lo, hi = int(cu_s[b]), int(cu_s[b + 1])
+                lo, hi = os_[b], os_[b + 1]
                 ck, cv = gather(kv_caches[idx], b)
                 out[lo:hi] = position_masked_attention(q[lo:hi], ck, cv, sel[b], impl.scale,
                                                        block_mask=masks[b])
