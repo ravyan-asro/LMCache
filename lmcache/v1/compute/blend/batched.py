@@ -235,6 +235,26 @@ class BatchedBlender:
                     "cu_q": cu_q, "cu_k": cu_k}
         return None
 
+    # -- missing pages (Exp 4) ---------------------------------------------------
+    def prefill_pages(self, token_ids, positions, slot_mapping, kv_caches, page_len):
+        """Generate the KV of pages that exist nowhere in the cache hierarchy: one
+        prefill pass over all of them, each page attending only to itself (the
+        chunk-local KV CacheBlend stores), KV written to `slot_mapping` at
+        `positions` (the request positions, as loaded KV is re-encoded to them).
+        token_ids / positions / slot_mapping: [n_pages * page_len] on the GPU."""
+        m = self.model
+        n = token_ids.numel()
+        assert n % page_len == 0
+        cu = torch.arange(0, n + 1, page_len, dtype=torch.int32, device=token_ids.device)
+        hidden_states = m._embed(token_ids)
+        residual = None
+        for idx, layer in enumerate(self._layers()):
+            q, k, v, residual, H, Hk, D = self._qkv(idx, layer, hidden_states, residual, positions)
+            self._write_kv(kv_caches[idx], slot_mapping, k, v)
+            out = torch.empty_like(q)
+            self._attn(idx, q, k, v, out, cu, page_len, page_len, cu_k=cu)
+            hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
+
     # -- InfoFlow ----------------------------------------------------------------
     def _layers(self):
         m = self.model
