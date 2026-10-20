@@ -9,8 +9,8 @@
 #                          request the top `ratio` tokens by value deviation
 #                          sum((V_fresh - V_loaded)^2) are kept, and the kept
 #                          queries attend to the request's full K/V with a
-#                          position-correct causal mask, using InfoFlow's
-#                          kernel for it (infoflow_attn.py), or FA's bottom-right
+#                          position-correct causal mask (FlexAttention,
+#                          infoflow_attn.py; Rya 10-20), or FA's bottom-right
 #                          alignment with LMCACHE_BLEND_AUTHORS_MASK=1
 #   later layers           kept tokens only: their K/V written over the loaded
 #                          K/V, same attention
@@ -35,9 +35,8 @@
 #   select   top int(ctx * ratio) by score, first document excluded
 #   pass 2   the selected tokens only, every layer, from the embeddings; their
 #            K/V are written into the paged cache and they attend to the
-#            request's context K/V with a position-correct causal mask, using
-#            InfoFlow's own kernel (infoflow_attn.py: Llama SDPA, Qwen /
-#            MiniMax FlashInfer custom mask; Rya 10-20)
+#            request's context K/V with a position-correct causal mask
+#            (FlexAttention, infoflow_attn.py; Rya 10-20)
 # Pass 2 starts from the selected tokens' embeddings; the per-request path
 # runs layer 0's QKV projection on every context token and then subsets
 # (same result, slightly more work).  Question K/V of pass 1 are not kept:
@@ -264,7 +263,7 @@ class BatchedBlender:
                 picks = list(torch.split(sel, [int(p.numel()) for p in picks]))
                 # per request: kept positions and their block mask (built once)
                 local = [p - ok[b] for b, p in enumerate(picks)]
-                if not authors and not BLEND_AUTHORS_MASK:
+                if (kernel == "flex" or not authors) and not BLEND_AUTHORS_MASK:
                     masks = [position_block_mask(local[b], lens[b]) for b in range(B)]
                 q_lens = [int(p.numel()) for p in picks]
                 cu_q, max_q = _cumsum0(q_lens, dev), max(q_lens)
@@ -287,7 +286,7 @@ class BatchedBlender:
                 for b in range(B):
                     lo, hi = oq[b], oq[b + 1]
                     ck, cv = self._read_kv(kv, slot_mapping[ok[b]:ok[b + 1]])
-                    if authors:
+                    if authors and kernel != "flex":       # InfoFlow's kernels (comparison)
                         out[lo:hi] = infoflow_attention(q[lo:hi], ck, cv, local[b], scale, kernel)
                     else:
                         out[lo:hi] = position_masked_attention(q[lo:hi], ck, cv, local[b], scale,
@@ -512,7 +511,9 @@ class BatchedBlender:
         os_ = _offsets(sel_lens)
         positions = torch.cat(sel)
         sel_slots = torch.cat([all_slots[b][sel[b]] for b in range(B)])
-        kernel = kernel_for(m.vllm_model)   # InfoFlow's own kernel and mask (Rya 10-20)
+        kernel = kernel_for(m.vllm_model)   # FlexAttention (Rya 10-20; infoflow_attn.py)
+        masks = ([position_block_mask(sel[b], lens[b]) for b in range(B)] if kernel == "flex"
+                 else [None] * B)          # one block mask per request, every layer
         hidden_states = m._embed(torch.cat([token_ids[b].to(dev)[sel[b]] for b in range(B)]))
         residual = None
         for idx, layer in enumerate(layers):
@@ -523,6 +524,7 @@ class BatchedBlender:
             for b in range(B):
                 lo, hi = os_[b], os_[b + 1]
                 ck, cv = gather(kv_caches[idx], b)
-                out[lo:hi] = infoflow_attention(q[lo:hi], ck, cv, sel[b], impl.scale, kernel)
+                out[lo:hi] = infoflow_attention(q[lo:hi], ck, cv, sel[b], impl.scale, kernel,
+                                                block_mask=masks[b])
             hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
         return {"sel": sel, "scores": scores}

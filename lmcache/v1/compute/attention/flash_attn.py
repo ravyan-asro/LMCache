@@ -62,22 +62,22 @@ class LMCFlashAttnBackend(AttentionInterface):
         # num_actual_tokens = query.shape[0]
         query_positions = getattr(attn_metadata, "query_positions", None)
         infoflow_kernel = getattr(attn_metadata, "infoflow_kernel", None)
-        if query_positions is not None and infoflow_kernel is not None:
-            # InfoFlow's recompute pass and CacheBlend's kept tokens: the kernel
-            # and mask of InfoFlow's own code (infoflow_attn.py; Rya 10-20).
+        if query_positions is not None and infoflow_kernel not in (None, "flex"):
+            # InfoFlow's own kernels, comparison only (LMCACHE_INFOFLOW_ATTN=sdpa /
+            # flashinfer; infoflow_attn.py).
             from lmcache.v1.compute.attention.infoflow_attn import infoflow_attention
 
             output.copy_(infoflow_attention(query, key, value, query_positions,
                                             self.vllm_attn_impl.scale, infoflow_kernel))
             return output
         if query_positions is not None:
-            # Non-contiguous query rows (CacheBlend's kept tokens with
-            # LMCACHE_CACHEBLEND_VARIANT=lmcache, position-correct mask): each
-            # query may attend only to keys at or before
-            # its own position.  FA's
-            # bottom-right causal alignment would be wrong here.  The block
-            # mask is built at the first layer and reused by the others
-            # (attn_metadata is created per compute_layer() pass).
+            # Non-contiguous query rows (CacheBlend's kept tokens, InfoFlow's
+            # recompute pass; position-correct mask): each query may attend only
+            # to keys at or before its own position; FA's bottom-right causal
+            # alignment would be wrong here.  FlexAttention (Rya 10-20,
+            # infoflow_attn.py); the block mask is built at the first layer and
+            # reused by the others (attn_metadata is created per compute_layer()
+            # pass).
             from lmcache.v1.compute.attention.position_masked import (
                 position_block_mask,
                 position_masked_attention,

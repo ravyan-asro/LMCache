@@ -50,13 +50,15 @@ INFOFLOW_SCORE_ALL_LAYERS = os.getenv("LMCACHE_INFOFLOW_SCORE_ALL_LAYERS", "0") 
 #                                  merged into the loaded K/V
 # and the selected tokens attend with the position-correct mask of CacheBlend's
 # own _make_partial_bias_gqa (commented out there) / InfoFlow's _compute_attention,
-# using InfoFlow's kernels (attention/infoflow_attn.py).  LMCache's V1 version
+# with FlexAttention (attention/infoflow_attn.py; Rya 10-20: the baselines stay
+# SSD-bound at their minimum ratios).  LMCache's V1 version
 # (selection by KEY deviation; loaded K/V kept below the check layer and for the
 # unselected tokens at it) remains as LMCACHE_CACHEBLEND_VARIANT=lmcache.
 CACHEBLEND_VARIANT = os.getenv("LMCACHE_CACHEBLEND_VARIANT", "original")
 # Recorded with results (rag_driver / serve.py provenance): CacheBlend as its
-# authors' code, InfoFlow's kernels, InfoFlow's scoring early exit (10-20).
-BLEND_IMPL = "authors-1020b"
+# authors' code, InfoFlow's scoring early exit, FlexAttention for both methods'
+# recomputed tokens (Rya 10-20; infoflow_attn.py).
+BLEND_IMPL = "authors-1020c"
 
 
 class LMCBlender:
@@ -299,7 +301,7 @@ class LMCBlender:
                 # RightMask).  Position-correct per Rya 10-11; set
                 # LMCACHE_BLEND_AUTHORS_MASK=1 for the authors' mask.
                 attn_metadata.query_positions = self.metadata.positions
-                if CACHEBLEND_VARIANT != "lmcache":   # the authors' kernel for that mask
+                if CACHEBLEND_VARIANT != "lmcache":   # kernel for that mask (infoflow_attn.py)
                     attn_metadata.infoflow_kernel = self._position_kernel()
             return q, old_k, old_v, residual, attn_output, attn_metadata
         else:
@@ -645,7 +647,7 @@ class LMCBlender:
         old_v[idx] = v
         self._paged_put_kv(layer_id, idx, k, v)
         attn_metadata.query_positions = self.metadata.positions
-        attn_metadata.infoflow_kernel = self._position_kernel()   # InfoFlow's own kernel
+        attn_metadata.infoflow_kernel = self._position_kernel()   # infoflow_attn.kernel_for
         return q, old_k, old_v, residual, attn_output, attn_metadata
 
     def _infoflow_accumulate(self, q, k_all, layer_id):
