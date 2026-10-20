@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Attention for queries at arbitrary sorted positions over a whole context
-(InfoFlow's recompute pass): query i sees key k iff k <= q_pos[i].
+"""Attention for queries at arbitrary sorted positions over a whole context:
+query i sees key k iff k <= q_pos[i].  CacheBlend's kept tokens and InfoFlow's
+recompute pass used it until 10-20; both now run InfoFlow's own kernels
+(infoflow_attn.py), this only with LMCACHE_CACHEBLEND_VARIANT=lmcache or
+LMCACHE_INFOFLOW_ATTN=flex.
 
 FlashAttention's bottom-right causal alignment is only right for a contiguous
 query suffix, so this used FlashInfer's dense custom mask: a (Lq, Lk) bool mask

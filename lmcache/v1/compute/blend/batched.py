@@ -4,16 +4,20 @@
 # per-request path behind the paper's CacheBlend numbers, for several requests
 # in one forward pass:
 #   layers < check_layer   every context token, fresh K/V, causal attention;
-#                          the paged cache keeps the loaded K/V (not written),
-#                          as in the per-request path
-#   check_layer (1)        every token; per request the top `ratio` tokens by
-#                          sum((K_fresh - K_loaded)^2) are kept; their K/V are
-#                          written into the paged cache, and the kept queries
-#                          attend to the request's full K/V with a position-
-#                          correct causal mask (position-masked FlexAttention,
-#                          as the per-request path; Rya 10-11), or FA's
-#                          bottom-right alignment with LMCACHE_BLEND_AUTHORS_MASK=1
-#   later layers           kept tokens only, same write + attention
+#                          the fresh K/V are written into the paged cache
+#   check_layer (1)        every token; fresh K/V of every token written; per
+#                          request the top `ratio` tokens by value deviation
+#                          sum((V_fresh - V_loaded)^2) are kept, and the kept
+#                          queries attend to the request's full K/V with a
+#                          position-correct causal mask, using InfoFlow's
+#                          kernel for it (infoflow_attn.py), or FA's bottom-right
+#                          alignment with LMCACHE_BLEND_AUTHORS_MASK=1
+#   later layers           kept tokens only: their K/V written over the loaded
+#                          K/V, same attention
+# as CacheBlend's own code and InfoFlow's re-implementation of it (blender.py,
+# CACHEBLEND_VARIANT; Rya 10-20).  LMCACHE_CACHEBLEND_VARIANT=lmcache restores
+# LMCache's V1 version: selection by key deviation, loaded K/V kept below the
+# check layer and for the unselected tokens at it, FlexAttention for the mask.
 # The loaded KV must already be in vLLM's paged cache with its positions
 # re-encoded for the request (the async loader does this).  Where the
 # per-request path reads a contiguous loaded-K buffer, this reads the paged
@@ -30,8 +34,9 @@
 #   select   top int(ctx * ratio) by score, first document excluded
 #   pass 2   the selected tokens only, every layer, from the embeddings; their
 #            K/V are written into the paged cache and they attend to the
-#            request's context K/V with a position-correct causal mask
-#            (position-masked FlexAttention, as LMCache's InfoFlow attention)
+#            request's context K/V with a position-correct causal mask, using
+#            InfoFlow's own kernel (infoflow_attn.py: Llama SDPA, Qwen /
+#            MiniMax FlashInfer custom mask; Rya 10-20)
 # Pass 2 starts from the selected tokens' embeddings; the per-request path
 # runs layer 0's QKV projection on every context token and then subsets
 # (same result, slightly more work).  Question K/V of pass 1 are not kept:
@@ -39,23 +44,52 @@
 # per-request path.
 
 # Standard
+from contextlib import contextmanager
 from typing import List, Optional
 
 # Third Party
 import torch
 
 # First Party
+from lmcache.v1.compute.attention.infoflow_attn import infoflow_attention, kernel_for
 from lmcache.v1.compute.attention.position_masked import (
     position_block_mask,
     position_masked_attention,
 )
-from lmcache.v1.compute.blend.blender import BLEND_AUTHORS_MASK
+from lmcache.v1.compute.blend.blender import BLEND_AUTHORS_MASK, CACHEBLEND_VARIANT
+from lmcache.v1.compute.blend.tp import tp_same, tp_size, tp_sum
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 except ImportError:
     from vllm.third_party.flashinfer.flashattn_hopper import flash_attn_varlen_func
+
+
+@contextmanager
+def _no_moe_tracking():
+    """The blend runs inside the engine step's forward context (start_load_kv).
+    With vLLM 0.18's fast_moe_cold_start (default below torch 2.11), each MoE
+    call takes the next name from forward_context.all_moe_layers; the blend's own
+    pass would use up the step's names and vLLM's forward would then fail its
+    MoE-count assertion.  As LMCLlamaModel.compute_layer: tracking off for the
+    blend, the step's state restored afterwards."""
+    try:
+        # Third Party
+        from vllm.forward_context import get_forward_context
+
+        ctx = get_forward_context()
+    except (ImportError, AssertionError):
+        ctx = None
+    if ctx is None:
+        yield
+        return
+    saved = ctx.all_moe_layers, ctx.moe_layer_index
+    ctx.all_moe_layers, ctx.moe_layer_index = None, 0
+    try:
+        yield
+    finally:
+        ctx.all_moe_layers, ctx.moe_layer_index = saved
 
 
 def _offsets(lengths: List[int]) -> List[int]:
@@ -80,10 +114,21 @@ class BatchedBlender:
 
     def __init__(self, vllm_model, ratio: float, check_layer: int = 1):
         self.model = infer_model_from_vllm(vllm_model, self)   # LMCLlamaModel
-        if self.model.minimax_qk_norm:
-            raise NotImplementedError("batched blend: MiniMax QK-norm not supported")
         self.ratio = ratio
         self.check_layer = check_layer
+
+    def _qk_norm(self, attn, q, k, H, Hk, D):
+        """QK-norm as vLLM's attention applies it (LMCLlamaModel.compute_layer):
+        MiniMax M2.5's norm spans all heads and is TP-synchronised (forward_qk);
+        Qwen3's is per head."""
+        if self.model.minimax_qk_norm:
+            # Third Party
+            from vllm.model_executor.layers.mamba.linear_attn import MiniMaxText01RMSNormTP
+
+            return MiniMaxText01RMSNormTP.forward_qk(attn.q_norm, attn.k_norm, q, k)
+        q = attn.q_norm(q.view(*q.shape[:-1], H, D)).view(q.shape)
+        k = attn.k_norm(k.view(*k.shape[:-1], Hk, D)).view(k.shape)
+        return q, k
 
     # -- paged cache access ----------------------------------------------------
     @staticmethod
@@ -143,6 +188,10 @@ class BatchedBlender:
         force_sel:   tests only: per request, the kept token indices to use
                      instead of the top-k (isolates rounding from logic).
         """
+        with _no_moe_tracking():
+            return self._blend(token_ids, block_table, kv_caches, return_hidden, force_sel)
+
+    def _blend(self, token_ids, block_table, kv_caches, return_hidden, force_sel):
         m = self.model
         dev = block_table.device
         lens = [int(t.numel()) for t in token_ids]
@@ -164,6 +213,8 @@ class BatchedBlender:
         sel = None                       # kept rows (global), after check_layer
         cu_q, max_q = cu_k, max_k
         oq = ok
+        authors = CACHEBLEND_VARIANT != "lmcache"
+        kernel = kernel_for(m.vllm_model)
 
         layers = m.vllm_model.model.layers[
             m.vllm_model.model.start_layer: m.vllm_model.model.end_layer]
@@ -181,27 +232,35 @@ class BatchedBlender:
             num_kv_heads = m.vllm_attn_layers[idx].num_kv_heads
             head_size = m.vllm_attn_layers[idx].head_size
             if m.has_qk_norm:
-                q = attn.q_norm(q.view(*q.shape[:-1], num_heads, head_size)).view(q.shape)
-                k = attn.k_norm(k.view(*k.shape[:-1], num_kv_heads, head_size)).view(k.shape)
+                q, k = self._qk_norm(attn, q, k, num_heads, num_kv_heads, head_size)
             q, k = attn.rotary_emb(positions if sel is None else positions[sel], q, k)
             kv = kv_caches[idx]
 
+            if authors and idx <= self.check_layer:
+                if idx == self.check_layer:      # value deviation, before the overwrite
+                    fresh, loaded = v, self._read_kv(kv, slot_mapping)[1].reshape(v.shape)
+                self._write_kv(kv, slot_mapping, k.view(-1, num_kv_heads, head_size),
+                               v.view(-1, num_kv_heads, head_size))
+            elif idx == self.check_layer:        # LMCache V1: key deviation
+                fresh, loaded = k, self._read_k(kv, slot_mapping).reshape(k.shape)
             if idx == self.check_layer:
                 # CacheBlend token selection (LMCBlender.process_qkv)
-                old_k = self._read_k(kv, slot_mapping).reshape(k.shape)
-                diff_k = torch.sum((k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1])
+                diff = torch.sum((fresh.to(torch.float32) - loaded.to(torch.float32)) ** 2, dim=[1])
+                diff = tp_sum(diff)              # over every rank's heads (blend/tp.py)
                 picks = []
                 for b in range(B):
                     lo, hi = ok[b], ok[b + 1]
                     if force_sel is not None:
                         picks.append(force_sel[b].to(dev) + lo)
                         continue
-                    top = torch.topk(diff_k[lo:hi], k=int((hi - lo) * self.ratio)).indices
+                    top = torch.topk(diff[lo:hi], k=int((hi - lo) * self.ratio)).indices
                     picks.append(torch.sort(top).values + lo)
-                sel = torch.cat(picks)
+                sel = tp_same(torch.cat(picks))  # identical rows on every TP rank
+                picks = list(torch.split(sel, [int(p.numel()) for p in picks]))
                 # per request: kept positions and their block mask (built once)
                 local = [p - ok[b] for b, p in enumerate(picks)]
-                masks = [position_block_mask(local[b], lens[b]) for b in range(B)]
+                if not authors and not BLEND_AUTHORS_MASK:
+                    masks = [position_block_mask(local[b], lens[b]) for b in range(B)]
                 q_lens = [int(p.numel()) for p in picks]
                 cu_q, max_q = _cumsum0(q_lens, dev), max(q_lens)
                 oq = _offsets(q_lens)
@@ -223,8 +282,11 @@ class BatchedBlender:
                 for b in range(B):
                     lo, hi = oq[b], oq[b + 1]
                     ck, cv = self._read_kv(kv, slot_mapping[ok[b]:ok[b + 1]])
-                    out[lo:hi] = position_masked_attention(q[lo:hi], ck, cv, local[b], scale,
-                                                           block_mask=masks[b])
+                    if authors:
+                        out[lo:hi] = infoflow_attention(q[lo:hi], ck, cv, local[b], scale, kernel)
+                    else:
+                        out[lo:hi] = position_masked_attention(q[lo:hi], ck, cv, local[b], scale,
+                                                               block_mask=masks[b])
 
             hidden_states, _ = attn.o_proj(out.view(-1, num_heads * head_size))
             hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
@@ -236,23 +298,34 @@ class BatchedBlender:
         return None
 
     # -- missing pages (Exp 4) ---------------------------------------------------
-    def prefill_pages(self, token_ids, positions, slot_mapping, kv_caches, page_len):
-        """Generate the KV of pages that exist nowhere in the cache hierarchy: one
-        prefill pass over all of them, each page attending only to itself (the
-        chunk-local KV CacheBlend stores), KV written to `slot_mapping` at
-        `positions` (the request positions, as loaded KV is re-encoded to them).
-        token_ids / positions / slot_mapping: [n_pages * page_len] on the GPU."""
+    def prefill_pages(self, token_ids, positions, slot_mapping, kv_caches, page_len=None,
+                      lengths=None):
+        """Generate the KV of pages (Exp 4) or documents (Exp 3 with eviction)
+        that exist nowhere in the cache hierarchy: one prefill pass over all of
+        them, each attending only to itself (the chunk-local KV CacheBlend
+        stores), KV written to `slot_mapping` at `positions` (the request
+        positions, as loaded KV is re-encoded to them).
+        token_ids / positions / slot_mapping: the pieces back to back, on the GPU;
+        `lengths` gives each piece's length (or all are `page_len` long)."""
+        with _no_moe_tracking():
+            self._prefill_pages(token_ids, positions, slot_mapping, kv_caches, page_len, lengths)
+
+    def _prefill_pages(self, token_ids, positions, slot_mapping, kv_caches, page_len, lengths):
         m = self.model
         n = token_ids.numel()
-        assert n % page_len == 0
-        cu = torch.arange(0, n + 1, page_len, dtype=torch.int32, device=token_ids.device)
+        if lengths is None:
+            assert n % page_len == 0
+            lengths = [page_len] * (n // page_len)
+        assert sum(lengths) == n
+        cu = _cumsum0(lengths, token_ids.device)
+        longest = max(lengths)
         hidden_states = m._embed(token_ids)
         residual = None
         for idx, layer in enumerate(self._layers()):
             q, k, v, residual, H, Hk, D = self._qkv(idx, layer, hidden_states, residual, positions)
             self._write_kv(kv_caches[idx], slot_mapping, k, v)
             out = torch.empty_like(q)
-            self._attn(idx, q, k, v, out, cu, page_len, page_len, cu_k=cu)
+            self._attn(idx, q, k, v, out, cu, longest, longest, cu_k=cu)
             hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
 
     # -- InfoFlow ----------------------------------------------------------------
@@ -274,8 +347,7 @@ class BatchedBlender:
         Hk = m.vllm_attn_layers[idx].num_kv_heads
         D = m.vllm_attn_layers[idx].head_size
         if m.has_qk_norm:
-            q = attn.q_norm(q.view(*q.shape[:-1], H, D)).view(q.shape)
-            k = attn.k_norm(k.view(*k.shape[:-1], Hk, D)).view(k.shape)
+            q, k = self._qk_norm(attn, q, k, H, Hk, D)
         q, k = attn.rotary_emb(positions, q, k)
         return q.view(-1, H, D), k.view(-1, Hk, D), v.view(-1, Hk, D), residual, H, Hk, D
 
@@ -288,14 +360,17 @@ class BatchedBlender:
 
     @staticmethod
     def _score(q, k_all, q_pos, ctx_len, H, Hk, D):
-        """LMCBlender._infoflow_accumulate for one request: head-mean attention,
-        L2 norm over query tokens, context part."""
+        """LMCBlender._infoflow_accumulate for one request: head-mean attention
+        (over every TP rank's heads, blend/tp.py), L2 norm over query tokens,
+        context part."""
         qh = q.float()
         kh = k_all.float().repeat_interleave(H // Hk, dim=1)
         logits = torch.einsum("qhd,nhd->hqn", qh, kh) * (D ** -0.5)
         key_pos = torch.arange(kh.shape[0], device=q.device)
         logits.masked_fill_(key_pos[None, None, :] > q_pos[None, :, None], float("-inf"))
-        attn_mean = torch.softmax(logits, dim=-1).mean(dim=0)       # [Q, N]
+        probs = torch.softmax(logits, dim=-1)
+        attn_mean = probs.mean(dim=0) if tp_size() == 1 else \
+            tp_sum(probs.sum(dim=0)) / (H * tp_size())               # [Q, N]
         return attn_mean[:, :ctx_len].norm(p=2, dim=0)
 
     @torch.no_grad()
@@ -321,6 +396,12 @@ class BatchedBlender:
         Returns {"sel": per request selected context indices (sorted),
                  "scores": per request scores}.
         """
+        with _no_moe_tracking():
+            return self._infoflow(token_ids, query_ids, first_lens, block_table, kv_caches, ratio,
+                                  score_layers, force_sel)
+
+    def _infoflow(self, token_ids, query_ids, first_lens, block_table, kv_caches, ratio,
+                  score_layers, force_sel):
         m = self.model
         dev = block_table.device
         B = len(token_ids)
@@ -373,6 +454,8 @@ class BatchedBlender:
             cand = torch.arange(first_lens[b], lens[b], device=dev)
             k_ = min(int(lens[b] * ratio), cand.numel())
             sel.append(cand[torch.topk(scores[b][cand], k=k_).indices].sort().values)
+        if force_sel is None and sum(int(x.numel()) for x in sel):   # identical on every TP rank
+            sel = list(torch.split(tp_same(torch.cat(sel)), [int(x.numel()) for x in sel]))
 
         # ---- pass 2: selected tokens, every layer, position-correct mask ----
         sel_lens = [int(s_.numel()) for s_ in sel]
@@ -381,7 +464,7 @@ class BatchedBlender:
         os_ = _offsets(sel_lens)
         positions = torch.cat(sel)
         sel_slots = torch.cat([all_slots[b][sel[b]] for b in range(B)])
-        masks = [position_block_mask(sel[b], lens[b]) for b in range(B)]
+        kernel = kernel_for(m.vllm_model)   # InfoFlow's own kernel and mask (Rya 10-20)
         hidden_states = m._embed(torch.cat([token_ids[b].to(dev)[sel[b]] for b in range(B)]))
         residual = None
         for idx, layer in enumerate(layers):
@@ -392,7 +475,6 @@ class BatchedBlender:
             for b in range(B):
                 lo, hi = os_[b], os_[b + 1]
                 ck, cv = gather(kv_caches[idx], b)
-                out[lo:hi] = position_masked_attention(q[lo:hi], ck, cv, sel[b], impl.scale,
-                                                       block_mask=masks[b])
+                out[lo:hi] = infoflow_attention(q[lo:hi], ck, cv, sel[b], impl.scale, kernel)
             hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
         return {"sel": sel, "scores": scores}

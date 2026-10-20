@@ -209,6 +209,11 @@ class SegmentTokenDatabase(TokenDatabase):
         self.registry_path = os.getenv("LMCACHE_SEGMENT_REGISTRY")
         self._registry_mtime = None
         self._registry_chunks = []
+        # Optional "skip_first": n in the registry: the first n registered chunks
+        # get no key (never stored or looked up).  Lets a driver prefill a chunk
+        # after a sink prefix (e.g. BOS) and store only the chunk's KV, as the
+        # CacheBlend and InfoFlow authors' code does.
+        self._registry_skip = 0
 
     def _make_key_by_hash(self, chunk_hash: str):
         return CacheEngineKey(
@@ -238,8 +243,10 @@ class SegmentTokenDatabase(TokenDatabase):
         mtime = (st.st_mtime_ns, st.st_size)
         if mtime != self._registry_mtime:
             with open(self.registry_path) as f:
-                chunks = json.load(f).get("chunks", [])
-            self._registry_chunks = [torch.tensor(c, dtype=torch.long) for c in chunks]
+                reg = json.load(f)
+            self._registry_chunks = [torch.tensor(c, dtype=torch.long)
+                                     for c in reg.get("chunks", [])]
+            self._registry_skip = int(reg.get("skip_first", 0))
             self._registry_mtime = mtime
         return self._registry_chunks
 
@@ -314,8 +321,10 @@ class SegmentTokenDatabase(TokenDatabase):
             "be less than the length of tokens."
         )
 
+        skip = 0
         if self.registry_path:
             token_chunks, sep_len = self._split_by_registry(tokens), 0
+            skip = self._registry_skip
         else:
             token_chunks, sep_len = self._fast_split_by_subtensor(tokens), self.sep_len
         start_idx = 0
@@ -326,6 +335,9 @@ class SegmentTokenDatabase(TokenDatabase):
                 start_idx += sep_len
                 end_idx += sep_len
                 # end_idx = min(end_idx, len(tokens))
+            if idx < skip:          # registry "skip_first": no key for this chunk
+                start_idx = end_idx
+                continue
             if start_idx >= num_falses:
                 if make_key:
                     yield (

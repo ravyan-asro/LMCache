@@ -23,6 +23,7 @@ import torch.cuda.nvtx as nvtx
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata, LMCBlendMetadata
+from lmcache.v1.compute.blend.tp import tp_check_same, tp_same, tp_size, tp_sum
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 
 logger = init_logger(__name__)
@@ -30,6 +31,23 @@ logger = init_logger(__name__)
 # CacheBlend's kept tokens attend with a position-correct causal mask unless
 # this is set (then FA's bottom-right causal alignment, as the authors' code).
 BLEND_AUTHORS_MASK = os.getenv("LMCACHE_BLEND_AUTHORS_MASK", "0") == "1"
+
+# CacheBlend as its authors' code does it (SIFT MLSys, Rya 10-20): CacheBlend's
+# vllm_blend (attention/backends/xformers.py) and InfoFlow's re-implementation
+# (InfoFlow-KV llm/models/*/kv_cache/recomputer.py, recompute_cacheblend):
+#   layers before the check layer  every token recomputed, its fresh K/V kept
+#   check layer                    fresh K/V of every token kept; the top
+#                                  ratio x context tokens by VALUE deviation
+#                                  sum((V_fresh - V_loaded)^2) are selected
+#   later layers                   only the selected tokens are recomputed and
+#                                  merged into the loaded K/V
+# and the selected tokens attend with the position-correct mask of CacheBlend's
+# own _make_partial_bias_gqa (commented out there) / InfoFlow's _compute_attention,
+# using InfoFlow's kernels (attention/infoflow_attn.py).  LMCache's V1 version
+# (selection by KEY deviation; loaded K/V kept below the check layer and for the
+# unselected tokens at it) remains as LMCACHE_CACHEBLEND_VARIANT=lmcache.
+CACHEBLEND_VARIANT = os.getenv("LMCACHE_CACHEBLEND_VARIANT", "original")
+BLEND_IMPL = "authors-1020"   # recorded with results (rag_driver provenance)
 
 
 class LMCBlender:
@@ -122,6 +140,23 @@ class LMCBlender:
             positions=None,
         )
 
+    def _log_selection(self, method, sel, ctx_len):
+        """LMCACHE_SELECTION_LOG=<path>: append this request's selected token
+        indices and chunk boundaries (diagnostics only; forces a device sync)."""
+        path = os.getenv("LMCACHE_SELECTION_LOG")
+        if not path:
+            return
+        import json
+
+        from lmcache.v1.compute.blend.tp import tp_rank
+
+        rec = {"method": method, "ctx_len": int(ctx_len), "tp_rank": tp_rank(),
+               "starts": [int(x) for x in self.gpu_connector.chunk_starts],
+               "ends": [int(x) for x in self.gpu_connector.chunk_ends],
+               "sel": sorted(int(x) for x in sel.tolist())}
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
     def _maybe_update_ratio(self):
         if not self.ratio_file or not os.path.exists(self.ratio_file):
             return
@@ -207,16 +242,26 @@ class LMCBlender:
 
         # ---- Original CacheBlend: dynamic top-k at check_layers ----
         elif layer_id in self.common_metadata.check_layers:
-            diff_k = torch.sum(
-                (k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1]
+            if CACHEBLEND_VARIANT == "lmcache":
+                fresh, loaded = k, old_k          # LMCache V1: key deviation
+            else:
+                fresh, loaded = v, old_v          # the authors' code: value deviation
+            diff = torch.sum(
+                (fresh.to(torch.float32) - loaded.to(torch.float32)) ** 2, dim=[1]
             )
-            total_len = diff_k.shape[0]
+            if CACHEBLEND_VARIANT != "lmcache":   # then every token's fresh K/V kept
+                old_k.copy_(k)                    # (after the deviation: old_v is the
+                old_v.copy_(v)                    # loaded buffer itself)
+            diff = tp_sum(diff)  # over every rank's heads (blend/tp.py)
+            total_len = diff.shape[0]
 
             # TODO(Jiayi): remove `[0]` hardcode
             topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
 
-            top_indices = torch.topk(diff_k, k=topk_num).indices
+            top_indices = torch.topk(diff, k=topk_num).indices
             top_indices, _ = torch.sort(top_indices)
+            top_indices = tp_same(top_indices)
+            self._log_selection("cacheblend", top_indices, total_len)
 
             k, v = k[top_indices], v[top_indices]
             q = q[top_indices]
@@ -245,9 +290,22 @@ class LMCBlender:
                 # RightMask).  Position-correct per Rya 10-11; set
                 # LMCACHE_BLEND_AUTHORS_MASK=1 for the authors' mask.
                 attn_metadata.query_positions = self.metadata.positions
+                if CACHEBLEND_VARIANT != "lmcache":   # the authors' kernel for that mask
+                    attn_metadata.infoflow_kernel = self._position_kernel()
             return q, old_k, old_v, residual, attn_output, attn_metadata
         else:
+            if CACHEBLEND_VARIANT != "lmcache" and not self.epic_mode:
+                old_k.copy_(k)                    # below the check layer: fresh K/V kept
+                old_v.copy_(v)
             return q, k, v, residual, attn_output, attn_metadata
+
+    def _position_kernel(self):
+        """InfoFlow's kernel for position-masked attention (infoflow_attn.py)."""
+        if getattr(self, "_if_kernel", None) is None:
+            from lmcache.v1.compute.attention.infoflow_attn import kernel_for
+
+            self._if_kernel = kernel_for(self.layerwise_model.vllm_model)
+        return self._if_kernel
 
     # NOTE(Jiayi): Exposing this `blend_layer` interface as we might
     # want to ochestrate the blending process elsewhere
@@ -402,6 +460,8 @@ class LMCBlender:
 
         starts = list(self.gpu_connector.chunk_starts)
         ends = list(self.gpu_connector.chunk_ends)
+        tp_check_same([ctx_len, len(starts), ends[0] if ends else -1, budget],
+                      "InfoFlow's context (length, chunks, first chunk end, budget)")
         covered = torch.zeros(ctx_len, dtype=torch.bool, device=device)
         for s_, e_ in zip(starts, ends):
             covered[s_:e_] = True
@@ -409,7 +469,7 @@ class LMCBlender:
 
         chunk_order = None
         if self.infoflow_reorder:
-            sel = torch.topk(self._if_scores, k=budget).indices
+            sel = tp_same(torch.topk(self._if_scores, k=budget).indices)
             perm, chunk_order = self._infoflow_reorder_perm(sel, starts, ends, ctx_len, device)
             self._infoflow_permute_paged(perm)
             inv = torch.empty_like(perm)
@@ -423,14 +483,15 @@ class LMCBlender:
             for _ in self.layerwise_model.compute_layer(torch.cat([tokens, query_tokens])):
                 pass
             self.metadata.clean()
-            sel = torch.topk(self._if_scores, k=budget).indices
+            sel = tp_same(torch.topk(self._if_scores, k=budget).indices)
             mark("stage2")
         else:
             candidates = torch.arange(ends[0], ctx_len, device=device)
             k = min(budget, candidates.numel())
-            sel = candidates[torch.topk(self._if_scores[candidates], k=k).indices]
+            sel = tp_same(candidates[torch.topk(self._if_scores[candidates], k=k).indices])
 
         self._if_imp = torch.unique(torch.cat([sel, gaps]))  # sorted
+        self._log_selection("infoflow", sel, ctx_len)
         self._if_phase = "recompute"
         # Nothing to recompute when the context is one stored chunk (the first
         # chunk is never selected) with no gaps: its loaded KV stays as is.  A
@@ -561,6 +622,7 @@ class LMCBlender:
         old_v[idx] = v
         self._paged_put_kv(layer_id, idx, k, v)
         attn_metadata.query_positions = self.metadata.positions
+        attn_metadata.infoflow_kernel = self._position_kernel()   # InfoFlow's own kernel
         return q, old_k, old_v, residual, attn_output, attn_metadata
 
     def _infoflow_accumulate(self, q, k_all, layer_id):
@@ -581,7 +643,10 @@ class LMCBlender:
         q_pos = self.metadata.positions
         key_pos = torch.arange(kh.shape[0], device=q.device)
         logits.masked_fill_(key_pos[None, None, :] > q_pos[None, :, None], float("-inf"))
-        attn_mean = torch.softmax(logits, dim=-1).mean(dim=0)  # [Q, N]
+        # Mean over ALL heads: local head sums added over the TP group (blend/tp.py)
+        probs = torch.softmax(logits, dim=-1)
+        attn_mean = probs.mean(dim=0) if tp_size() == 1 else \
+            tp_sum(probs.sum(dim=0)) / (num_heads * tp_size())
         self._if_scores += attn_mean[:, : self._if_ctx_len].norm(p=2, dim=0)
 
     def _paged_slots(self, layer_id, slots):
