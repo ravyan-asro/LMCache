@@ -27,7 +27,8 @@
 # BatchedBlender.infoflow: InfoFlow KV for several requests, the same algorithm
 # as LMCBlender._infoflow_blend (no reorder; the per-request path behind the
 # paper's InfoFlow numbers):
-#   pass 1   the question tokens only, every layer, attending to the request's
+#   pass 1   the question tokens only, layers 0..max(score_layers) (InfoFlow's
+#            scorer stops there too, _EarlyExit), attending to the request's
 #            loaded context K/V followed by their own fresh K/V (bottom-right
 #            causal = exact); at the scoring layers every context token gets
 #            the L2 norm over question tokens of the head-mean attention
@@ -56,7 +57,11 @@ from lmcache.v1.compute.attention.position_masked import (
     position_block_mask,
     position_masked_attention,
 )
-from lmcache.v1.compute.blend.blender import BLEND_AUTHORS_MASK, CACHEBLEND_VARIANT
+from lmcache.v1.compute.blend.blender import (
+    BLEND_AUTHORS_MASK,
+    CACHEBLEND_VARIANT,
+    INFOFLOW_SCORE_ALL_LAYERS,
+)
 from lmcache.v1.compute.blend.tp import tp_same, tp_size, tp_sum
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 
@@ -419,7 +424,9 @@ class BatchedBlender:
             s = all_slots[b]
             return kv[0][s // block_size, s % block_size], kv[1][s // block_size, s % block_size]
 
-        # ---- pass 1: question tokens, every layer, scores at score_layers ----
+        # ---- pass 1: question tokens up to the last scoring layer, scores at
+        # score_layers (later layers do not feed the scores) ----
+        last = len(layers) - 1 if INFOFLOW_SCORE_ALL_LAYERS else min(max(score_layers), len(layers) - 1)
         q_pos = [torch.arange(n, n + ql, device=dev) for n, ql in zip(lens, qlens)]
         positions = torch.cat(q_pos)
         cu_q = _cumsum0(qlens, dev)
@@ -444,6 +451,8 @@ class BatchedBlender:
             self._attn(idx, q, torch.cat(ks), torch.cat(vs), out, cu_q, max(qlens),
                        max(kv_lens), cu_k=cu_k)
             hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
+            if idx == last:
+                break
 
         # ---- select ----
         sel = []

@@ -32,6 +32,13 @@ logger = init_logger(__name__)
 # this is set (then FA's bottom-right causal alignment, as the authors' code).
 BLEND_AUTHORS_MASK = os.getenv("LMCACHE_BLEND_AUTHORS_MASK", "0") == "1"
 
+# InfoFlow's scoring pass runs the question through layers 0..max(scoring
+# layers) only, as InfoFlow's scorer does (InfoFlow-KV llm/models/qwen/kv_cache/
+# importance_scorer.py:165-171, _EarlyExit; Rya 10-20); the scores come from the
+# scoring layers alone, so the selection is the same.  LMCACHE_INFOFLOW_SCORE_
+# ALL_LAYERS=1 runs every layer (comparison only).
+INFOFLOW_SCORE_ALL_LAYERS = os.getenv("LMCACHE_INFOFLOW_SCORE_ALL_LAYERS", "0") == "1"
+
 # CacheBlend as its authors' code does it (SIFT MLSys, Rya 10-20): CacheBlend's
 # vllm_blend (attention/backends/xformers.py) and InfoFlow's re-implementation
 # (InfoFlow-KV llm/models/*/kv_cache/recomputer.py, recompute_cacheblend):
@@ -47,7 +54,9 @@ BLEND_AUTHORS_MASK = os.getenv("LMCACHE_BLEND_AUTHORS_MASK", "0") == "1"
 # (selection by KEY deviation; loaded K/V kept below the check layer and for the
 # unselected tokens at it) remains as LMCACHE_CACHEBLEND_VARIANT=lmcache.
 CACHEBLEND_VARIANT = os.getenv("LMCACHE_CACHEBLEND_VARIANT", "original")
-BLEND_IMPL = "authors-1020"   # recorded with results (rag_driver provenance)
+# Recorded with results (rag_driver / serve.py provenance): CacheBlend as its
+# authors' code, InfoFlow's kernels, InfoFlow's scoring early exit (10-20).
+BLEND_IMPL = "authors-1020b"
 
 
 class LMCBlender:
@@ -451,9 +460,15 @@ class LMCBlender:
         next(retriever)
         if self.infoflow_reorder:
             self._if_local_pos = self._chunk_local_positions(ctx_len, device)
-        for _ in range(self.num_layers):
+        # Every layer's KV is retrieved (pass 2 needs all of it in the paged
+        # cache); the question stops after the last scoring layer (same layer
+        # on every TP rank: infoflow_layers comes from the same settings).
+        last = self._infoflow_last_layer()
+        for i in range(self.num_layers):
             next(retriever)
-            next(executor)
+            if i <= last:
+                next(executor)
+        executor.close()
         next(retriever)
         self.metadata.clean()
         mark("stage1")
@@ -480,8 +495,10 @@ class LMCBlender:
             # Stage 2: GLOBAL positions on the reordered layout, KV from HBM.
             self._if_phase = "score_paged"
             self._if_scores = torch.zeros(ctx_len, dtype=torch.float32, device=device)
-            for _ in self.layerwise_model.compute_layer(torch.cat([tokens, query_tokens])):
-                pass
+            executor = self.layerwise_model.compute_layer(torch.cat([tokens, query_tokens]))
+            for _ in range(self._infoflow_last_layer() + 1):
+                next(executor)
+            executor.close()
             self.metadata.clean()
             sel = tp_same(torch.topk(self._if_scores, k=budget).indices)
             mark("stage2")
@@ -530,6 +547,12 @@ class LMCBlender:
         self._if_phase = None
         self._if_scores = None
         self._if_local_pos = None
+
+    def _infoflow_last_layer(self):
+        """Last layer the scoring pass runs (see INFOFLOW_SCORE_ALL_LAYERS)."""
+        if INFOFLOW_SCORE_ALL_LAYERS:
+            return self.num_layers - 1
+        return min(max(self.infoflow_layers), self.num_layers - 1)
 
     def _chunk_local_positions(self, ctx_len, device):
         """Position of every context token inside its stored chunk (HL geometry)."""

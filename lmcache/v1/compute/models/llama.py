@@ -124,7 +124,18 @@ class LMCLlamaModel(nn.Module):
             ctx = None
             saved_moe_layers = None
             saved_moe_idx = 0
+        # Restored in `finally`, so a caller that stops this generator early
+        # (close(): InfoFlow's scoring pass stops after its last scoring layer,
+        # as InfoFlow's scorer does) still gives vLLM its MoE tracking back;
+        # otherwise vLLM's next forward fails its MoE-count assertion.
+        try:
+            yield from self._compute_layers(input_ids)
+        finally:
+            if ctx is not None:
+                ctx.all_moe_layers = saved_moe_layers
+                ctx.moe_layer_index = saved_moe_idx
 
+    def _compute_layers(self, input_ids: torch.Tensor):
         hidden_states = self._embed(input_ids.cuda())
         residual = None
 
@@ -234,8 +245,3 @@ class LMCLlamaModel(nn.Module):
                 self._per_layer_forward_ms[idx] = _fwd_start.elapsed_time(_fwd_end)
 
             yield
-
-        # Restore MoE tracking after manual forward completes
-        if ctx is not None:
-            ctx.all_moe_layers = saved_moe_layers
-            ctx.moe_layer_index = saved_moe_idx
