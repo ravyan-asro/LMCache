@@ -333,6 +333,45 @@ class BatchedBlender:
             self._attn(idx, q, k, v, out, cu, longest, longest, cu_k=cu)
             hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
 
+    # -- missing documents as chunked prefill (Exp 3 / Exp 4, Rya 10-20) ----------
+    def regen_pieces(self, token_ids, positions, slot_mapping, kv_caches, block_table,
+                     q_lens, k_lens):
+        """Prefill the next piece of several documents whose KV exists nowhere,
+        in one varlen pass; each document attends only to itself (the chunk KV
+        CacheBlend stores), never to another document or request.
+
+        A piece is the next part of its document.  Its K/V are written at
+        slot_mapping (its request's blocks, at request positions, as loaded KV
+        is re-encoded to them) and its queries attend, through the paged cache,
+        to the document's tokens up to the piece's end: the earlier pieces
+        (written in earlier steps) and itself, causal (bottom-right alignment is
+        exact: the piece is the suffix of its document so far).
+
+        token_ids / positions / slot_mapping: the pieces back to back, on the GPU;
+        block_table: (P, w) int32, per piece its request's blocks from the
+        document's first block on (documents are block-aligned);
+        q_lens: piece lengths; k_lens: the document's tokens up to each piece's
+        end.  At most one piece per document per call."""
+        with _no_moe_tracking():
+            self._regen_pieces(token_ids, positions, slot_mapping, kv_caches, block_table,
+                               q_lens, k_lens)
+
+    def _regen_pieces(self, token_ids, positions, slot_mapping, kv_caches, block_table,
+                      q_lens, k_lens):
+        dev = token_ids.device
+        cu_q = _cumsum0(q_lens, dev)
+        seqused_k = torch.tensor(k_lens, dtype=torch.int32, device=dev)
+        hidden_states = self.model._embed(token_ids)
+        residual = None
+        for idx, layer in enumerate(self._layers()):
+            q, k, v, residual, H, Hk, D = self._qkv(idx, layer, hidden_states, residual, positions)
+            kv = kv_caches[idx]
+            self._write_kv(kv, slot_mapping, k, v)
+            out = torch.empty_like(q)
+            self._attn(idx, q, kv[0], kv[1], out, cu_q, max(q_lens), max(k_lens),
+                       seqused_k=seqused_k, block_table=block_table)
+            hidden_states, residual = self._finish_layer(layer, out, residual, H, D)
+
     # -- InfoFlow ----------------------------------------------------------------
     def _layers(self):
         m = self.model
