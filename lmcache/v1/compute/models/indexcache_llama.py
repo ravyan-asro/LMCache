@@ -233,6 +233,7 @@ class LMCIndexCacheLlamaModel(nn.Module):
                 misbehaving_heads_set=mh_set,
                 imp_threshold=self.config.ca_threshold,
                 strong_consistency=self.config.ca_consistency,
+                fixed_denominator=self.config.ca_denom == "fixed",
             )
             la_hot_tile = get_hot_tile_code_fast(
                 attn_scores=attn_scores,

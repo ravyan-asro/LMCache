@@ -12,6 +12,7 @@ class IndexCacheConfig:
     threshold: float = 0.001       # LA hot-tile threshold
     ca_threshold: float = 0.01     # CA important-page threshold
     ca_consistency: float = 0.1    # CA strong-consistency threshold
+    ca_denom: str = "orig"         # CA consistency denominator: "orig" (j+1) or "fixed" (K-j)
     if_thresh: bool = True         # use threshold mode (vs top-pct)
     local_pct: float = 0.5        # fraction when if_thresh=False
     misbehaving_heads: List[Tuple[int, int]] = field(default_factory=list)
@@ -26,6 +27,7 @@ class IndexCacheConfig:
             threshold=float(os.getenv("LMCACHE_INDEXCACHE_THRESHOLD", "0.001")),
             ca_threshold=float(os.getenv("LMCACHE_INDEXCACHE_CA_THRESHOLD", "0.01")),
             ca_consistency=float(os.getenv("LMCACHE_INDEXCACHE_CA_CONSISTENCY", "0.1")),
+            ca_denom=os.getenv("LMCACHE_INDEXCACHE_CA_DENOM", "orig"),
             if_thresh=os.getenv("LMCACHE_INDEXCACHE_IF_THRESH", "1") == "1",
             local_pct=float(os.getenv("LMCACHE_INDEXCACHE_LOCAL_PCT", "0.5")),
             pipeline_blend=os.getenv("LMCACHE_INDEXCACHE_PIPELINE_BLEND", "1") == "1",

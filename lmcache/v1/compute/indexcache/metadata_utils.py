@@ -15,6 +15,7 @@ def find_important_pages_fast(
     misbehaving_heads_set: set,
     imp_threshold: float = 0.01,
     strong_consistency: float = 0.1,
+    fixed_denominator: bool = False,
 ) -> torch.Tensor:
     """Select important KV pages per head based on attention-score consistency.
 
@@ -30,6 +31,8 @@ def find_important_pages_fast(
         misbehaving_heads_set: set of (layer, head) tuples
         imp_threshold: per-token importance threshold
         strong_consistency: fraction of queries that must be important
+        fixed_denominator: divide by the K-j queries that can attend to key j
+            (causal) instead of j+1 (the original code; Rya 10-22 probe)
 
     Returns:
         kvcolidx: (B, H, ceil(num_pages/8)) uint8 — bit-packed page selection
@@ -58,8 +61,12 @@ def find_important_pages_fast(
     num_imp = important_mask.sum(dim=-2, dtype=torch.int16)  # (B, H, K)
     del important_mask
 
-    # Column j in lower-triangular has j+1 non-zero entries
-    total_causal = torch.arange(1, K + 1, device=attn_scores.device, dtype=torch.float)
+    # Original: j+1 (the count for row j, not column j).  Column j of the
+    # lower-triangular mask has K-j non-zero entries (queries j..K-1).
+    if fixed_denominator:
+        total_causal = torch.arange(K, 0, -1, device=attn_scores.device, dtype=torch.float)
+    else:
+        total_causal = torch.arange(1, K + 1, device=attn_scores.device, dtype=torch.float)
     consistency = num_imp.float() / total_causal
 
     # Strong tokens per key
