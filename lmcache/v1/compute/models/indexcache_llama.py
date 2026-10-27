@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lmcache.logging import init_logger
+from lmcache.v1.compute.indexcache import ablation as sift_ablation
 from lmcache.v1.compute.indexcache.config import IndexCacheConfig
 from lmcache.v1.compute.indexcache.metadata_utils import (
     find_important_pages_fast,
@@ -375,6 +376,11 @@ class LMCIndexCacheLlamaModel(nn.Module):
                         la_hot_tile_code_cache=la_hot_tile,
                         device=str(q.device),
                     )
+
+                if sift_ablation.active():     # bit-vector ablations / static baselines (Rya 10-27)
+                    sparse_n_indices, sparse_n_offsets, sparse_n_mask_counts = sift_ablation.apply(
+                        layer_idx, self.num_layers, sparse_n_indices, sparse_n_offsets,
+                        sparse_n_mask_counts, seq_len, offset_list, q_fa3, k_fa3)
 
                 softmax_scale = self.head_dim ** (-0.5)
                 out, _, _, _ = fa3_fwd(
