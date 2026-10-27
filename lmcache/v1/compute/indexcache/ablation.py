@@ -12,10 +12,11 @@ document rows:
   sink_window       generic static mask (HPCA review): key block 0 + the last w blocks,
                     one w per layer so the layer computes as many document-row blocks
                     as SIFT's
-  sink_window_topk  key block 0 + the last w blocks (w = SIFT's mean LA blocks per row)
-                    + the top-k earlier blocks by pooled q.k (mean query of the row block
-                    . mean key of the key block, the query head's KV head), k filling
-                    SIFT's per-layer budget; the selection's runtime is not modelled
+  sink_window_topk  key block 0 + the last w blocks (w = SIFT's mean LA blocks per row,
+                    rounded down) + top-k earlier blocks by pooled q.k (mean query of the
+                    row block . mean key of the key block, the query head's KV head): per
+                    head, the highest-scoring candidates over all rows until the layer
+                    computes SIFT's block count; the selection's runtime is not modelled
 Blocks are 128 x 128 and documents are page (128) aligned, so a row block lies in one
 document.  LMCACHE_SIFT_ABLATION_STATS (a file): one JSON line per prefill, blocks kept
 summed over layers and query heads.
@@ -128,21 +129,22 @@ def apply(layer_idx, num_layers, idx, off, masks, seq_len, offset_list, q, k):
                 break
         out = _window(M, N, best[0], doc_rows, dev)[None].expand(H, M, N) | (sift & q_rows[None, :, None])
     else:                                                                # sink_window_topk
-        w = max(1, round((sift & la[None]).sum().item() / H / max(1, doc_rows.sum().item())))
+        rows_n = max(1, doc_rows.sum().item())
+        w = max(1, int((sift & la[None]).sum().item() / H / rows_n))
         win = _window(M, N, w, doc_rows, dev)
-        k_top = max(0, round((budget - win.sum().item()) / max(1, doc_rows.sum().item())))
         out = win[None].expand(H, M, N).clone()
-        if k_top:
+        extra = int(round(budget - win.sum().item()))                    # per head
+        if extra > 0:
             m_ = torch.arange(M, device=dev)[:, None]
             cand = doc_rows[:, None] & (n[None, :] < m_ - w + 1) & (n[None, :] > 0)
             qp = _pooled(q[0], M)                                         # (H, M, D)
             kp = _pooled(k[0], N).repeat_interleave(H // k.shape[2], 0)   # (H, N, D)
             score = torch.einsum("hmd,hnd->hmn", qp, kp).masked_fill(~cand[None], float("-inf"))
-            kk = min(k_top, N)
-            val, top = score.topk(kk, dim=-1)
-            sel = torch.zeros_like(out)
+            # the head's highest-scoring candidate blocks over all its rows: SIFT's budget exactly
+            val, top = score.view(H, M * N).topk(min(extra, M * N), dim=-1)
+            sel = torch.zeros(H, M * N, dtype=torch.bool, device=dev)
             sel.scatter_(-1, top, torch.isfinite(val))
-            out |= sel
+            out |= sel.view(H, M, N)
         out |= sift & q_rows[None, :, None]
     if STATS:
         a = _acc.setdefault("cur", {"kept": 0, "la_kept": 0, "ca_kept": 0, "la_total": 0, "ca_total": 0,
