@@ -9,6 +9,14 @@ document rows:
                     sink): does cross-attention (CA) matter?
   dense_la          every causal tile of the row's own document, SIFT's CA pages: does
                     sparsifying local attention (LA) cost accuracy?
+  la_window         cheap LA: each document's first block + the last w own-document blocks
+                    (w per layer, SIFT's local block count); SIFT's CA
+  ca_static         cheap CA: SIFT's LA; per row the first b earlier-document blocks in a
+                    fixed order -- the global sink, each earlier document's first block
+                    (nearest document first), then the blocks just before the document
+                    (b per layer, SIFT's cross block count)
+  ca_topk           runtime CA: SIFT's LA; per head the earlier-document blocks with the
+                    highest pooled q.k over all rows, SIFT's cross block count
   sink_window       generic static mask (HPCA review): key block 0 + the last w blocks,
                     one w per layer so the layer computes as many document-row blocks
                     as SIFT's
@@ -29,7 +37,7 @@ import os
 # Third Party
 import torch
 
-MODES = ("none", "no_ca", "dense_la", "sink_window", "sink_window_topk")
+MODES = ("none", "no_ca", "dense_la", "la_window", "ca_static", "ca_topk", "sink_window", "sink_window_topk")
 _BLOCK = 128
 _acc = {}
 
@@ -70,8 +78,9 @@ def _from_dense(dense):
 
 
 def _regions(offset_list, M, N, dev):
-    """(la, ca, doc_rows): own-document causal tiles, earlier-document tiles (M, N),
-    and which row blocks are document rows (M,)."""
+    """(la, ca, doc_rows, row_start, starts): own-document causal tiles, earlier-document
+    tiles (M, N), which row blocks are document rows (M,), each row's document's first
+    block (M,), the documents' first blocks."""
     starts = torch.tensor([0] + list(offset_list[:-1]), device=dev) // _BLOCK
     ctx = offset_list[-1] // _BLOCK
     m = torch.arange(M, device=dev)
@@ -81,7 +90,28 @@ def _regions(offset_list, M, N, dev):
     causal = n[None, :] <= m[:, None]
     la = doc_rows[:, None] & causal & (n[None, :] >= row_start[:, None])
     ca = doc_rows[:, None] & (n[None, :] < row_start[:, None])
-    return la, ca, doc_rows
+    return la, ca, doc_rows, row_start, starts
+
+
+def _closest(count, target, hi):
+    """The b in 1..hi whose count(b) (non-decreasing) is closest to target."""
+    best = None
+    for b in range(1, hi + 1):
+        c = count(b)
+        if best is None or abs(c - target) < abs(best[1] - target):
+            best = (b, c)
+        if c >= target:
+            break
+    return best[0]
+
+
+def _topk_over_rows(score, cand, extra, H, M, N):
+    """Per head the `extra` highest-scoring candidate blocks over all its rows."""
+    score = score.masked_fill(~cand[None], float("-inf"))
+    val, top = score.view(H, M * N).topk(min(extra, M * N), dim=-1)
+    sel = torch.zeros(H, M * N, dtype=torch.bool, device=score.device)
+    sel.scatter_(-1, top, torch.isfinite(val))
+    return sel.view(H, M, N)
 
 
 def _window(M, N, w, doc_rows, dev):
@@ -109,7 +139,7 @@ def apply(layer_idx, num_layers, idx, off, masks, seq_len, offset_list, q, k):
     M = N = -(-seq_len // _BLOCK)
     dev = q.device
     sift = _to_dense(idx, off, H, M, N)
-    la, ca, doc_rows = _regions(offset_list, M, N, dev)
+    la, ca, doc_rows, row_start, starts = _regions(offset_list, M, N, dev)
     q_rows = ~doc_rows
     n = torch.arange(N, device=dev)
     budget = (sift & doc_rows[None, :, None]).sum().item() / H          # per head
@@ -119,6 +149,30 @@ def apply(layer_idx, num_layers, idx, off, masks, seq_len, offset_list, q, k):
         out = (sift & ~ca) | (ca & (n == 0))[None]
     elif MODE == "dense_la":
         out = sift | la[None]
+    elif MODE == "la_window":
+        m_ = torch.arange(M, device=dev)[:, None]
+        band = lambda w: la & ((n[None, :] > m_ - w) | (n[None, :] == row_start[:, None]))
+        w = _closest(lambda w: band(w).sum().item(), (sift & la[None]).sum().item() / H, N)
+        out = (sift & ~la[None]) | band(w)[None]
+    elif MODE == "ca_static":
+        blk_doc = torch.searchsorted(starts, n, right=True) - 1
+        row_doc = torch.searchsorted(starts, torch.arange(M, device=dev), right=True) - 1
+        is_start = torch.zeros(N, dtype=torch.bool, device=dev)
+        is_start[starts] = True
+        rank = torch.where(n[None, :] == 0, torch.zeros((), device=dev),                 # global sink
+               torch.where(is_start[None, :], 1.0 + (row_doc[:, None] - blk_doc[None, :] - 1),  # document sinks
+                           1000.0 + (row_start[:, None] - 1 - n[None, :])))              # most recent first
+        rank = rank.masked_fill(~ca, float("inf"))
+        pos = rank.argsort(dim=-1, stable=True).argsort(dim=-1)
+        b = _closest(lambda b: (ca & (pos < b)).sum().item(), (sift & ca[None]).sum().item() / H, N)
+        out = (sift & ~ca[None]) | (ca & (pos < b))[None]
+    elif MODE == "ca_topk":
+        qp = _pooled(q[0], M)
+        kp = _pooled(k[0], N).repeat_interleave(H // k.shape[2], 0)
+        extra = int(round((sift & ca[None]).sum().item() / H))
+        out = sift & ~ca[None]
+        if extra > 0:
+            out = out | _topk_over_rows(torch.einsum("hmd,hnd->hmn", qp, kp), ca, extra, H, M, N)
     elif MODE == "sink_window":
         best = None
         for w in range(1, N + 1):
@@ -139,12 +193,8 @@ def apply(layer_idx, num_layers, idx, off, masks, seq_len, offset_list, q, k):
             cand = doc_rows[:, None] & (n[None, :] < m_ - w + 1) & (n[None, :] > 0)
             qp = _pooled(q[0], M)                                         # (H, M, D)
             kp = _pooled(k[0], N).repeat_interleave(H // k.shape[2], 0)   # (H, N, D)
-            score = torch.einsum("hmd,hnd->hmn", qp, kp).masked_fill(~cand[None], float("-inf"))
             # the head's highest-scoring candidate blocks over all its rows: SIFT's budget exactly
-            val, top = score.view(H, M * N).topk(min(extra, M * N), dim=-1)
-            sel = torch.zeros(H, M * N, dtype=torch.bool, device=dev)
-            sel.scatter_(-1, top, torch.isfinite(val))
-            out |= sel.view(H, M, N)
+            out |= _topk_over_rows(torch.einsum("hmd,hnd->hmn", qp, kp), cand, extra, H, M, N)
         out |= sift & q_rows[None, :, None]
     if STATS:
         a = _acc.setdefault("cur", {"kept": 0, "la_kept": 0, "ca_kept": 0, "la_total": 0, "ca_total": 0,
